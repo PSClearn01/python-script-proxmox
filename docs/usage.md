@@ -39,7 +39,7 @@ If credentials are missing or the connection fails, the script will print a clea
 
 ## Stage 2 — Template Selection
 
-The script scans all storage pools on the node for LXC templates (`vztmpl` content type) and presents a numbered list:
+The script scans all storage pools on the node for LXC templates (`vztmpl` content type) and presents a numbered list. The last option always allows you to **upload a custom template** from a local file:
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -52,12 +52,38 @@ The script scans all storage pools on the node for LXC templates (`vztmpl` conte
   [ 3]  alpine-3.20-default_20240501_amd64.tar.xz
         storage: local  |  size: 3.2 MB
 
+  [ 4]  ⬆  Upload a custom template from local file
+
   Select a template number: 1
 
   ✓ Selected: ubuntu-24.04-standard_24.04-2_amd64.tar.zst
 ```
 
-> **Tip:** If no templates appear, you need to download them first. See the [Downloading Templates](#downloading-templates) section below.
+> **Tip:** If no templates appear, you can still upload your own — just select the upload option.
+
+### Uploading a Custom Template
+
+Select the upload option to use your own container template (`.tar.gz`, `.tar.xz`, or `.tar.zst`). The script will:
+
+1. Prompt for the **path to your local template file**
+2. Let you choose a **storage pool** that accepts template uploads (`vztmpl` content type)
+3. **Upload the file** to the selected storage via the Proxmox API
+4. Automatically use the uploaded template for container creation
+
+```
+  ── Upload Custom Template ──
+  Supported formats: .tar.gz, .tar.xz, .tar.zst
+
+  Path to template file: ~/templates/my-custom-ubuntu.tar.gz
+
+  ✓ Upload target: local (only eligible storage)
+
+  ⟳ Uploading my-custom-ubuntu.tar.gz (95.2 MB) to 'local' …
+  ⟳ Upload task started: UPID:pmx-4:00001B3C:...
+  ✓ Template uploaded successfully!
+```
+
+> **Note:** The template file must exist on the machine running the script. Paths with `~` and quotes are handled automatically.
 
 ---
 

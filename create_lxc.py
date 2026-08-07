@@ -17,9 +17,18 @@ import os
 import sys
 import getpass
 import textwrap
+import mimetypes
 
+import requests
+import urllib3
 from dotenv import load_dotenv
 from proxmoxer import ProxmoxAPI
+
+# Suppress InsecureRequestWarning for self-signed Proxmox certs
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Supported template file extensions
+TEMPLATE_EXTENSIONS = (".tar.gz", ".tar.xz", ".tar.zst")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -107,29 +116,212 @@ def list_templates(proxmox, node):
     return templates
 
 
-def pick_template(templates):
-    """Display a numbered list of templates and let the user choose one."""
-    if not templates:
-        print("\n✗ No LXC templates found on this node.")
-        print("  Upload a template via the Proxmox UI or `pveam`.\n")
+def list_template_storages(proxmox, node):
+    """
+    Return a list of storage pools that accept 'vztmpl' content.
+
+    These are the storages where template files can be uploaded.
+    """
+    eligible = []
+    storages = proxmox.nodes(node).storage.get()
+
+    for store in storages:
+        content_types = store.get("content", "")
+        if "vztmpl" in content_types:
+            eligible.append(store)
+
+    return eligible
+
+
+def pick_template_storage(proxmox, node):
+    """
+    Let the user pick a storage pool to upload the template to.
+
+    Only storages that accept vztmpl content are listed.
+    """
+    eligible = list_template_storages(proxmox, node)
+
+    if not eligible:
+        print("\n  ✗ No storage pools accept template uploads (vztmpl).")
+        print("    Configure a storage pool with 'vztmpl' content type.\n")
         sys.exit(1)
 
+    if len(eligible) == 1:
+        selected = eligible[0]["storage"]
+        print(f"\n  ✓ Upload target: {selected} (only eligible storage)\n")
+        return selected
+
+    print("\n┌─────────────────────────────────────────────┐")
+    print("│       Storage Pools for Template Upload     │")
+    print("└─────────────────────────────────────────────┘")
+
+    for idx, store in enumerate(eligible, start=1):
+        total_gb = store.get("total", 0) / (1024 ** 3)
+        avail_gb = store.get("avail", 0) / (1024 ** 3)
+        print(f"  [{idx:>2}]  {store['storage']}")
+        print(f"        type: {store.get('type', '?')}  |  "
+              f"total: {total_gb:.1f} GB  |  free: {avail_gb:.1f} GB")
+
+    while True:
+        choice = input("\n  Select a storage pool for upload: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(eligible):
+            selected = eligible[int(choice) - 1]["storage"]
+            print(f"\n  ✓ Upload target: {selected}\n")
+            return selected
+        print("  ✗ Invalid selection, try again.")
+
+
+def validate_template_path(filepath):
+    """Validate that the file exists and has a supported template extension."""
+    if not os.path.isfile(filepath):
+        return False, f"File not found: {filepath}"
+
+    if not any(filepath.endswith(ext) for ext in TEMPLATE_EXTENSIONS):
+        return False, (
+            f"Unsupported file type. "
+            f"Expected one of: {', '.join(TEMPLATE_EXTENSIONS)}"
+        )
+
+    return True, None
+
+
+def upload_template(proxmox, node, host, token_id, token_secret, filepath,
+                    storage):
+    """
+    Upload a local template file to a Proxmox storage pool.
+
+    Uses the Proxmox REST API multipart upload endpoint:
+        POST /nodes/{node}/storage/{storage}/upload
+
+    Args:
+        proxmox: ProxmoxAPI handle (used only for task polling).
+        node: Target Proxmox node name.
+        host: Proxmox host (e.g. '192.168.1.50:8006').
+        token_id: Full API token ID (e.g. 'root@pam!mytoken').
+        token_secret: API token secret.
+        filepath: Absolute path to the local template file.
+        storage: Target storage pool name.
+
+    Returns a template dict compatible with pick_template output.
+    """
+    filename = os.path.basename(filepath)
+    file_size = os.path.getsize(filepath)
+    size_mb = file_size / (1024 * 1024)
+
+    print(f"  ⟳ Uploading {filename} ({size_mb:.1f} MB) to '{storage}' …")
+
+    upload_url = (
+        f"https://{host}/api2/json/nodes/{node}"
+        f"/storage/{storage}/upload"
+    )
+    headers = {
+        "Authorization": f"PVEAPIToken={token_id}={token_secret}",
+    }
+
+    content_type = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
+
+    try:
+        with open(filepath, "rb") as fh:
+            files = {
+                "filename": (filename, fh, content_type),
+            }
+            data = {
+                "content": "vztmpl",
+            }
+            response = requests.post(
+                upload_url,
+                headers=headers,
+                files=files,
+                data=data,
+                verify=False,
+            )
+            response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        print(f"\n  ✗ Upload failed: {exc}\n")
+        sys.exit(1)
+
+    result = response.json()
+    task_id = result.get("data")
+    if task_id:
+        print(f"  ⟳ Upload task started: {task_id}")
+        try:
+            wait_for_task(proxmox, node, task_id)
+        except Exception as exc:
+            print(f"\n  ✗ Upload task failed: {exc}\n")
+            sys.exit(1)
+
+    print(f"  ✓ Template uploaded successfully!\n")
+
+    volid = f"{storage}:vztmpl/{filename}"
+    return {
+        "volid": volid,
+        "storage": storage,
+        "filename": filename,
+        "size": file_size,
+    }
+
+
+def pick_template(proxmox, node, host, token_id, token_secret, templates):
+    """
+    Display a numbered list of templates and let the user choose one,
+    or upload a custom template from a local file.
+    """
     print("\n┌─────────────────────────────────────────────┐")
     print("│         Available LXC Templates             │")
     print("└─────────────────────────────────────────────┘")
 
-    for idx, tpl in enumerate(templates, start=1):
-        size_mb = tpl["size"] / (1024 * 1024) if tpl["size"] else 0
-        print(f"  [{idx:>2}]  {tpl['filename']}")
-        print(f"        storage: {tpl['storage']}  |  size: {size_mb:.1f} MB")
+    if templates:
+        for idx, tpl in enumerate(templates, start=1):
+            size_mb = tpl["size"] / (1024 * 1024) if tpl["size"] else 0
+            print(f"  [{idx:>2}]  {tpl['filename']}")
+            print(f"        storage: {tpl['storage']}  |  size: {size_mb:.1f} MB")
+    else:
+        print("\n  (no existing templates found on this node)")
+
+    upload_idx = len(templates) + 1
+    print(f"\n  [{upload_idx:>2}]  ⬆  Upload a custom template from local file")
 
     while True:
         choice = input("\n  Select a template number: ").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(templates):
-            selected = templates[int(choice) - 1]
+        if not choice.isdigit():
+            print("  ✗ Invalid selection, try again.")
+            continue
+
+        idx = int(choice)
+        if 1 <= idx <= len(templates):
+            selected = templates[idx - 1]
             print(f"\n  ✓ Selected: {selected['filename']}\n")
             return selected
-        print("  ✗ Invalid selection, try again.")
+        elif idx == upload_idx:
+            return _handle_template_upload(
+                proxmox, node, host, token_id, token_secret
+            )
+        else:
+            print("  ✗ Invalid selection, try again.")
+
+
+def _handle_template_upload(proxmox, node, host, token_id, token_secret):
+    """Prompt for a local template file path and upload it."""
+    print("\n  ── Upload Custom Template ──")
+    print(f"  Supported formats: {', '.join(TEMPLATE_EXTENSIONS)}\n")
+
+    while True:
+        filepath = input("  Path to template file: ").strip()
+        # Handle quoted paths and ~ expansion
+        filepath = filepath.strip('"').strip("'")
+        filepath = os.path.expanduser(filepath)
+        filepath = os.path.abspath(filepath)
+
+        valid, err = validate_template_path(filepath)
+        if valid:
+            break
+        print(f"  ✗ {err}")
+
+    storage = pick_template_storage(proxmox, node)
+    template = upload_template(
+        proxmox, node, host, token_id, token_secret, filepath, storage
+    )
+    return template
 
 
 # ──────────────────────────────────────────────────────────────
@@ -400,9 +592,11 @@ def main():
     proxmox = connect(host, token_id, token_secret)
     print(f"  ✓ Connected to node: {node}\n")
 
-    # 2. Pick a template
+    # 2. Pick a template (existing or upload a custom one)
     templates = list_templates(proxmox, node)
-    template = pick_template(templates)
+    template = pick_template(
+        proxmox, node, host, token_id, token_secret, templates
+    )
 
     # 3. Pick storage
     storage = pick_storage(proxmox, node)
