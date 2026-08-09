@@ -1,6 +1,6 @@
-# Proxmox LXC Manager
+# Proxmox VM & LXC Manager
 
-An interactive Python script that creates and deletes LXC containers on a Proxmox VE node from available container templates. The script connects to the Proxmox API, discovers templates and existing containers on the target node (`pmx-4`), and walks you through configuring, deploying, or deleting containers.
+An interactive Python script that creates, clones, and deletes LXC containers and QEMU virtual machines on a Proxmox VE node. The script connects to the Proxmox API, discovers templates, ISO images, existing containers, and virtual machines on the target node (`pmx-4`), and walks you through configuring, deploying, cloning, or deleting resources.
 
 ---
 
@@ -18,18 +18,29 @@ An interactive Python script that creates and deletes LXC containers on a Proxmo
 
 ## Features
 
-- **Template discovery** — automatically scans all storage pools on the target node for available LXC templates (`vztmpl`)
-- **Interactive menus** — numbered selection lists for templates and storage pools
-- **Full container configuration** — prompts for VMID, hostname, root password, CPU, memory, swap, disk size, networking, and more
-- **DHCP or static IP** — supports both automatic and manual network configuration with bridge and gateway options
-- **Confirmation summary** — displays all settings for review before creating anything
-- **Auto-start** — optionally starts the container immediately after creation
+- **LXC template discovery & upload** — automatically scans storage pools for available LXC templates (`vztmpl`) with support for uploading local template files (`.tar.gz`, `.tar.xz`, `.tar.zst`)
+- **LXC container cloning** — clone existing LXC containers with support for full (independent copy) or linked (shared base) clones, custom hostnames, target storage selection, and descriptions
+- **VM creation from ISO** — create QEMU virtual machines from ISO images stored on Proxmox storage pools
+- **ISO upload support** — upload local ISO images (`.iso`, `.img`) directly to eligible Proxmox storage pools via multipart REST API
+- **OS type selection** — target OS profiles including Linux (2.6+, 2.4), Windows variants (Win 11 / Server 2025, Win 10 / 2016–2022, Win 8, Win 7, Win XP), Solaris, and Other
+- **BIOS selection** — choose between SeaBIOS (legacy BIOS) and OVMF (UEFI with automatic EFI disk provisioning)
+- **SCSI controller selection** — configure disk controllers with support for VirtIO SCSI Single, VirtIO SCSI, or LSI 53C895A
+- **QEMU Guest Agent support** — toggle QEMU Guest Agent enablement during VM provisioning
+- **Full container & VM configuration** — interactively set VMID, hostname/name, CPU (cores/sockets), memory, swap/ballooning, disk size, display adapter, and networking
+- **DHCP or static IP for LXCs** — supports automatic and manual network configuration with bridge and gateway options
+- **Confirmation summary** — displays all settings for review before creating, cloning, or deleting resources
+- **Auto-start** — optionally start containers or VMs immediately after creation or cloning
+- **Container & VM deletion** — list LXC containers and QEMU VMs with multi-select deletion (individual numbers, `all`, or `q` to cancel)
+- **Safe deletion workflow** — automatically stops running containers and VMs before deletion, guarded by a mandatory `yes` confirmation prompt
+- **Expanded main menu** — interactive main menu with 6 structured options to manage containers and VMs in a single session without restarting the script:
+  1. **Create LXC from template**
+  2. **Clone an existing LXC container**
+  3. **Delete LXC container(s)**
+  4. **Create VM from ISO**
+  5. **Delete VM(s)**
+  6. **Exit**
 - **Secure credentials** — API token and host stored in a `.env` file, kept out of version control
-- **Smart defaults** — auto-suggests the next available VMID, sensible resource defaults
-- **Container deletion** — lists all LXC containers on the node and lets you select one or more to delete
-- **Multi-select deletion** — pick individual containers by number, select all at once, or cancel
-- **Safe deletion workflow** — automatically stops running containers before deletion, with a confirmation gate requiring `yes` to proceed
-- **Main menu** — choose between creating and deleting containers in a single session without restarting the script
+- **Smart defaults** — auto-suggests next available VMID and sensible resource defaults
 
 ---
 
@@ -87,7 +98,7 @@ cp .env.example .env
 | `PROXMOX_HOST`         | ✅       | —        | Proxmox host URL (e.g. `https://192.168.1.100:8006`)                        |
 | `PROXMOX_TOKEN_ID`     | ✅       | —        | API Token ID in `user@realm!tokenname` format                               |
 | `PROXMOX_TOKEN_SECRET` | ✅       | —        | API Token secret value                                                      |
-| `PROXMOX_NODE`         | ❌       | `pmx-4`  | Target Proxmox node name where containers will be managed                   |
+| `PROXMOX_NODE`         | ❌       | `pmx-4`  | Target Proxmox node name where containers and VMs will be managed           |
 
 ### Example `.env`
 
@@ -106,7 +117,7 @@ PROXMOX_NODE=pmx-4
 
 ```
 python-script-proxmox/
-├── create_lxc.py          # Main script — create & delete LXC containers
+├── create_lxc.py          # Main script — create, clone, & delete LXC containers and QEMU VMs
 ├── requirements.txt       # Python dependencies
 ├── .env.example           # Credential template (safe to commit)
 ├── .env                   # Your actual credentials (git-ignored)

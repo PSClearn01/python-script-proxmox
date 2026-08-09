@@ -1,6 +1,6 @@
 # Usage Guide
 
-This guide walks through a complete run of the LXC manager script, covering both container creation and deletion.
+This guide walks through a complete run of the Proxmox VM & LXC manager script, covering LXC container creation, cloning, deletion, and QEMU virtual machine creation and deletion.
 
 ---
 
@@ -15,15 +15,23 @@ After connecting to Proxmox, the script presents a **main menu**:
 ```
 ┌─────────────────────────────────────────────┐
 │               Main Menu                     │
+├─────────────────────────────────────────────┤
+│  LXC Containers                             │
+│  [1]  Create LXC from template              │
+│  [2]  Clone an existing LXC container       │
+│  [3]  Delete LXC container(s)               │
+├─────────────────────────────────────────────┤
+│  Virtual Machines                           │
+│  [4]  Create VM from ISO                    │
+│  [5]  Delete VM(s)                          │
+├─────────────────────────────────────────────┤
+│  [6]  Exit                                  │
 └─────────────────────────────────────────────┘
-  [1]  Create a new LXC container
-  [2]  Delete existing LXC container(s)
-  [3]  Exit
 
   Select an option:
 ```
 
-The menu loops after each operation, so you can create and delete multiple containers in a single session.
+The menu loops after each operation, so you can perform multiple management tasks in a single session.
 
 ---
 
@@ -33,7 +41,7 @@ The script loads credentials from `.env` and connects to the Proxmox API.
 
 ```
 ══════════════════════════════════════════════════
-  Proxmox LXC Manager — Target node: pmx-4
+  Proxmox VM & LXC Manager — Target node: pmx-4
 ══════════════════════════════════════════════════
 
   ⟳ Connecting to Proxmox (192.168.1.50:8006) …
@@ -233,23 +241,116 @@ Upload a `.tar.gz`, `.tar.xz`, or `.tar.zst` template file to:
 /var/lib/vz/template/cache/
 ```
 
-## Creating and Deleting in One Session
+---
 
-The script returns to the main menu after each operation, so you can create and delete multiple containers without restarting:
+## Clone LXC Container
 
-```bash
-python create_lxc.py
-# → Select [1] to create a container
-# → After creation, you're back at the menu
-# → Select [2] to delete containers
-# → Select [3] to exit
+Select option **[2]** from the main menu to enter the LXC container cloning workflow.
+
+### Step 1 — Select Source Container
+
+The script scans the node and displays all existing LXC containers with status indicators (`🟢` running, `⚫` stopped):
+
+```
+┌─────────────────────────────────────────────┐
+│       LXC Containers Available to Clone     │
+└─────────────────────────────────────────────┘
+  [ 1]  🟢  CT 100 — web-server-01
+        status: running  |  cpus: 2  |  memory: 1024 MB
+  [ 2]  🟢  CT 101 — db-server
+        status: running  |  cpus: 4  |  memory: 2048 MB
+  [ 3]  ⚫  CT 102 — test-box
+        status: stopped  |  cpus: 1  |  memory: 512 MB
+
+  Select a container to clone (or 'q' to cancel): 1
+
+  ✓ Clone source: CT 100 — web-server-01
+```
+
+### Step 2 — Configure Clone Settings
+
+Configure the clone parameters. Defaults are shown in brackets — press Enter to accept them:
+
+```
+┌─────────────────────────────────────────────┐
+│          Clone Configuration                │
+└─────────────────────────────────────────────┘
+
+  Source: CT 100 — web-server-01
+
+  New Container ID (VMID) [106]: 
+  New hostname [web-server-01-clone]: 
+
+  ── Clone Type ──
+  Full clone:   Independent copy (uses more disk space)
+  Linked clone: Shares base image (faster, less disk)
+
+  Clone type (full/linked) [full]: 
+
+  ── Target Storage for Clone ──
+  Use a different storage for the clone? (y/n) [n]: y
+
+┌─────────────────────────────────────────────┐
+│           Available Storage Pools            │
+└─────────────────────────────────────────────┘
+  [ 1]  local-lvm
+        type: lvmthin  |  total: 200.0 GB  |  free: 150.3 GB
+  [ 2]  local-zfs
+        type: zfspool   |  total: 500.0 GB  |  free: 420.7 GB
+
+  Select a storage pool number: 2
+
+  ✓ Selected storage: local-zfs
+
+  Description (optional) [Clone of CT 100 (web-server-01)]: 
+  Start container after cloning? (y/n) [n]: y
+```
+
+#### Clone Configuration Options Reference
+
+| Setting                  | Default                      | Description                                                  |
+|--------------------------|------------------------------|--------------------------------------------------------------|
+| **New Container ID (VMID)** | Auto                      | Unique numeric ID for the cloned container                   |
+| **New hostname**         | `<source_name>-clone`        | Hostname assigned to the clone                               |
+| **Clone type**           | `full`                       | `full` (independent copy) or `linked` (shares base image)    |
+| **Target storage**       | Source storage               | Target storage pool (optional, for full clones only)         |
+| **Description**          | `Clone of CT <vmid> (<name>)` | Optional description/notes for the cloned container          |
+| **Start after cloning**  | `no`                         | Whether to start the container immediately after cloning     |
+
+### Step 3 — Review and Execute Clone
+
+A summary is displayed before executing the clone operation:
+
+```
+┌─────────────────────────────────────────────┐
+│              Clone Summary                   │
+└─────────────────────────────────────────────┘
+
+  Source:         CT 100 — web-server-01
+  New VMID:       106
+  New hostname:   web-server-01-clone
+  Clone type:     Full
+  Target storage: local-zfs
+  Description:    Clone of CT 100 (web-server-01)
+  Start after:    Yes
+  Node:           pmx-4
+
+  Proceed with clone? (y/n): y
+
+  ⟳ Cloning container …
+  ✓ Task started: UPID:pmx-4:00001C3D:...
+  ⟳ Waiting for clone to complete …
+  ✓ Container 106 cloned successfully!
+
+  ⟳ Starting cloned container …
+  ✓ Container 106 is now running.
 ```
 
 ---
 
 ## Deleting Containers
 
-Select option **[2]** from the main menu to enter the deletion workflow.
+Select option **[3]** from the main menu to enter the LXC container deletion workflow.
 
 ### Step 1 — Container List
 
@@ -318,3 +419,291 @@ The script stops running containers, then deletes each one:
 ```
 
 If a container fails to stop, it is skipped and an error is shown.
+
+---
+
+## Create VM from ISO
+
+Select option **[4]** from the main menu to enter the QEMU VM creation workflow.
+
+### Step 1 — ISO Selection
+
+The script scans all storage pools on the node for available ISO images (`iso` content type) and presents a numbered list. The last option allows you to upload a custom ISO image from a local file (`.iso` and `.img` extensions supported):
+
+```
+┌─────────────────────────────────────────────┐
+│           Available ISO Images              │
+└─────────────────────────────────────────────┘
+  [ 1]  ubuntu-24.04-live-server-amd64.iso
+        storage: local  |  size: 2621.4 MB
+  [ 2]  debian-12.5.0-amd64-netinst.iso
+        storage: local  |  size: 650.0 MB
+
+  [ 3]  ⬆  Upload an ISO from local file
+
+  Select an ISO number: 1
+
+  ✓ Selected: ubuntu-24.04-live-server-amd64.iso
+```
+
+> **Tip:** If no ISO images appear, select the upload option to upload one directly from your local system.
+
+### Uploading a Custom ISO Image
+
+Select the upload option to use your own ISO image (`.iso` or `.img`). The script will:
+
+1. Prompt for the path to your local ISO file (supports `~` expansion and quotes)
+2. Let you choose a storage pool that accepts ISO uploads (`iso` content type)
+3. Upload the file to the selected storage via the Proxmox REST API
+4. Automatically use the uploaded ISO for VM creation
+
+```
+  ── Upload ISO Image ──
+  Supported formats: .iso, .img
+
+  Path to ISO file: ~/iso/ubuntu-24.04-live-server-amd64.iso
+
+┌─────────────────────────────────────────────┐
+│        Storage Pools for ISO Upload         │
+└─────────────────────────────────────────────┘
+  [ 1]  local
+        type: dir  |  total: 100.0 GB  |  free: 45.2 GB
+
+  Select a storage pool for upload: 1
+
+  ✓ Upload target: local
+
+  ⟳ Uploading ubuntu-24.04-live-server-amd64.iso (2621.4 MB) to 'local' …
+  ⟳ Upload task started: UPID:pmx-4:00002A1B:...
+  ✓ ISO uploaded successfully!
+```
+
+### Step 2 — Storage Selection for VM Disk
+
+The script prompts for a storage pool for the VM primary disk, filtering storage pools by the `images` content type:
+
+```
+  ── VM Disk Storage ──
+
+┌─────────────────────────────────────────────┐
+│           Available Storage Pools            │
+└─────────────────────────────────────────────┘
+  [ 1]  local-lvm
+        type: lvmthin  |  total: 200.0 GB  |  free: 150.3 GB
+  [ 2]  local-zfs
+        type: zfspool   |  total: 500.0 GB  |  free: 420.7 GB
+
+  Select a storage pool number: 1
+
+  ✓ Selected storage: local-lvm
+```
+
+### Step 3 — VM Configuration
+
+You will be prompted for each virtual machine setting. Defaults are shown in brackets — press Enter to accept them:
+
+```
+┌─────────────────────────────────────────────┐
+│       New Virtual Machine Configuration     │
+└─────────────────────────────────────────────┘
+
+  VM ID (VMID) [107]: 
+  VM name: ubuntu-vm-01
+
+  ── OS Type ──
+  [ 1]  Linux 2.6 – 6.x kernel  (l26)
+  [ 2]  Linux 2.4 kernel  (l24)
+  [ 3]  Windows 11 / Server 2025  (win11)
+  [ 4]  Windows 10 / Server 2016–2022  (win10)
+  [ 5]  Windows 8 / Server 2012  (win8)
+  [ 6]  Windows 7 / Server 2008 R2  (win7)
+  [ 7]  Windows XP / Server 2003  (wxp)
+  [ 8]  Solaris / OpenSolaris  (solaris)
+  [ 9]  Other / Unspecified  (other)
+
+  Select OS type [1]: 1
+  ✓ OS type: l26
+
+  ── BIOS Type ──
+  [1]  SeaBIOS (legacy BIOS — most compatible)
+  [2]  OVMF (UEFI — required for some modern OSes)
+
+  BIOS type [1]: 1
+  ✓ BIOS: seabios
+
+  CPU sockets [1]: 1
+  CPU cores per socket [2]: 4
+  CPU type [host]: host
+  Memory (MB) [2048]: 4096
+  Balloon memory minimum (MB, 0 to disable) [0]: 2048
+  Disk size (GB) [32]: 50
+
+  ── SCSI Controller ──
+  [1]  VirtIO SCSI Single (recommended)
+  [2]  VirtIO SCSI
+  [3]  LSI 53C895A (legacy)
+
+  SCSI controller [1]: 1
+  ✓ SCSI controller: virtio-scsi-single
+
+  ── Network Configuration ──
+
+  Network adapter model [virtio]: virtio
+  Bridge interface [vmbr0]: vmbr0
+  Enable firewall? (y/n) [n]: n
+  Display type (std/virtio/vmware/qxl/none) [std]: std
+
+  ── Boot Order ──
+  The VM will try to boot from the ISO (CD-ROM) first,
+  then fall back to the primary disk.
+
+  Start on boot? (y/n) [n]: y
+  Start VM after creation? (y/n) [y]: y
+  Enable QEMU Guest Agent? (y/n) [y]: y
+```
+
+### Configuration Options Reference (VM)
+
+| Setting                  | Default               | Description                                                                 |
+|--------------------------|-----------------------|-----------------------------------------------------------------------------|
+| **VM ID (VMID)**         | Auto                  | Unique numeric ID; auto-suggested as the next available                     |
+| **VM name**              | —                     | Required. DNS-friendly name for the virtual machine                         |
+| **OS type**              | `l26`                 | Proxmox OS type (`l26`, `win11`, `win10`, `other`, etc.)                    |
+| **BIOS type**            | `seabios`             | `seabios` (legacy BIOS) or `ovmf` (UEFI; automatically provisions EFI disk) |
+| **CPU sockets**          | `1`                   | Number of CPU sockets allocated                                             |
+| **CPU cores per socket** | `2`                   | Number of CPU cores per socket                                              |
+| **CPU type**             | `host`                | CPU model pass-through or emulation mode                                    |
+| **Memory (MB)**          | `2048`                | Dedicated RAM allocation in megabytes                                       |
+| **Balloon minimum (MB)** | `0`                   | Minimum memory target for dynamic memory ballooning (`0` to disable)        |
+| **Disk size (GB)**       | `32`                  | Storage disk allocation size in gigabytes                                   |
+| **SCSI controller**      | `virtio-scsi-single`  | Hardware SCSI controller type (`virtio-scsi-single`, `virtio-scsi-pci`, `lsi`)|
+| **Network model**        | `virtio`              | Network adapter device model (`virtio`, `e1000`, etc.)                      |
+| **Bridge interface**     | `vmbr0`               | Linux bridge interface to attach network adapter to                        |
+| **Firewall**             | `no`                  | Enable or disable Proxmox firewall on virtual network adapter               |
+| **Display type**         | `std`                 | VGA graphics display device (`std`, `virtio`, `qxl`, `vmware`, `none`)      |
+| **QEMU agent**           | `yes`                 | Enable QEMU Guest Agent support                                             |
+| **Boot order**           | `order=ide2;scsi0`    | Configured automatically to boot from CD-ROM (ISO) first, then disk          |
+| **Start on boot**        | `no`                  | Whether the VM automatically starts when host boots                         |
+| **Start after creation** | `yes`                 | Whether to start the VM immediately after creation completes                |
+
+### Step 4 — Review and Create VM
+
+A full summary is displayed before creating the VM via the QEMU API:
+
+```
+┌─────────────────────────────────────────────┐
+│            Virtual Machine Summary           │
+└─────────────────────────────────────────────┘
+
+  VMID:           107
+  Name:           ubuntu-vm-01
+  OS type:        l26
+  BIOS:           seabios
+  ISO:            ubuntu-24.04-live-server-amd64.iso
+  Storage:        local-lvm
+  CPU:            1 socket(s) × 4 core(s)  [host]
+  Memory:         4096 MB
+  Balloon:        2048 MB
+  Disk:           50 GB
+  SCSI:           virtio-scsi-single
+  Network:        virtio, bridge=vmbr0
+  Firewall:       No
+  Display:        std
+  QEMU agent:     Yes
+  On boot:        Yes
+  Start after:    Yes
+  Node:           pmx-4
+
+  Proceed with VM creation? (y/n): y
+
+  ⟳ Creating virtual machine …
+  ✓ Task started: UPID:pmx-4:00002B3C:...
+  ⟳ Waiting for task to complete …
+  ✓ VM 107 created successfully!
+
+  ⟳ Starting virtual machine …
+  ✓ VM 107 is now running.
+```
+
+---
+
+## Delete VMs
+
+Select option **[5]** from the main menu to enter the QEMU VM deletion workflow.
+
+### Step 1 — VM List
+
+All QEMU virtual machines on the node are listed with their status:
+
+```
+┌─────────────────────────────────────────────┐
+│          QEMU VMs on This Node              │
+└─────────────────────────────────────────────┘
+  [ 1]  🟢  VM 107 — ubuntu-vm-01
+        status: running  |  cpus: 4  |  memory: 4096 MB
+  [ 2]  ⚫  VM 108 — win11-test
+        status: stopped  |  cpus: 2  |  memory: 8192 MB
+
+  Enter VM numbers to delete (comma-separated),
+  or 'all' to select all, or 'q' to cancel.
+
+  Selection: 1
+```
+
+### Step 2 — Selection
+
+You can select VMs in several ways:
+
+| Input       | Effect                              |
+|-------------|-------------------------------------|
+| `1`         | Select VM #1 only                   |
+| `1,2`       | Select VMs #1 and #2                |
+| `all`       | Select all listed VMs               |
+| `q`         | Cancel and return to the menu       |
+
+### Step 3 — Confirmation
+
+A summary of selected VMs is shown. Running VMs are noted:
+
+```
+┌─────────────────────────────────────────────┐
+│            VMs Marked for Deletion           │
+└─────────────────────────────────────────────┘
+  • VM 107 — ubuntu-vm-01  (running)
+
+  ⚠  1 VM(s) are currently running and will be stopped first.
+
+  ⚠  This action is IRREVERSIBLE. Proceed with deletion? (yes/no): yes
+```
+
+> **Safety:** You must type the full word `yes` to proceed — `y` alone will abort. This prevents accidental deletion.
+
+### Step 4 — Deletion
+
+The script stops running VMs, then deletes each one via the QEMU API:
+
+```
+  ── VM 107 (ubuntu-vm-01) ──
+  ⟳ Stopping VM 107 …
+  ✓ VM 107 stopped.
+  ⟳ Deleting VM 107 …
+  ✓ VM 107 deleted successfully!
+```
+
+If a VM fails to stop, it is skipped and an error is shown.
+
+---
+
+## Creating and Deleting in One Session
+
+The script returns to the main menu after each operation, so you can perform multiple container and VM actions without restarting:
+
+```bash
+python create_lxc.py
+# → Select [1] to create an LXC container from a template
+# → Select [2] to clone an existing LXC container
+# → Select [3] to delete LXC container(s)
+# → Select [4] to create a QEMU VM from an ISO
+# → Select [5] to delete VM(s)
+# → Select [6] to exit
+```

@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-Proxmox LXC Manager
-===================
-Interactive script to create and delete LXC containers on a Proxmox node
-(pmx-4) from available container templates.
+Proxmox VM & LXC Manager
+=========================
+Interactive script to manage LXC containers and QEMU virtual machines
+on a Proxmox node.
+
+Features:
+  • Create LXC containers from templates (with optional template upload)
+  • Clone existing LXC containers (full or linked clones)
+  • Create QEMU VMs from ISO images (with optional ISO upload)
+  • Delete LXC containers and QEMU VMs
 
 Authenticates via API token loaded from a .env file.
 
@@ -30,6 +36,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Supported template file extensions
 TEMPLATE_EXTENSIONS = (".tar.gz", ".tar.xz", ".tar.zst")
+
+# Supported ISO file extensions
+ISO_EXTENSIONS = (".iso", ".img")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -85,7 +94,56 @@ def connect(host, token_id, token_secret):
 
 
 # ──────────────────────────────────────────────────────────────
-# Template discovery
+# Task helpers
+# ──────────────────────────────────────────────────────────────
+
+def wait_for_task(proxmox, node, task_id, timeout=120, interval=2):
+    """Poll a Proxmox task until it completes or times out."""
+    elapsed = 0
+    while elapsed < timeout:
+        status = proxmox.nodes(node).tasks(task_id).status.get()
+        if status.get("status") == "stopped":
+            if status.get("exitstatus") == "OK":
+                return
+            else:
+                raise RuntimeError(
+                    f"Task exited with status: {status.get('exitstatus')}"
+                )
+        time.sleep(interval)
+        elapsed += interval
+
+    raise TimeoutError(f"Task {task_id} did not complete within {timeout}s")
+
+
+def next_vmid(proxmox):
+    """Ask the cluster for the next available VMID."""
+    try:
+        return proxmox.cluster.nextid.get()
+    except Exception:
+        return 100  # fallback
+
+
+def prompt_value(label, default=None, required=False, cast=None):
+    """Prompt the user for a value with an optional default."""
+    suffix = f" [{default}]" if default is not None else ""
+    while True:
+        value = input(f"  {label}{suffix}: ").strip()
+        if not value and default is not None:
+            value = str(default)
+        if required and not value:
+            print("  ✗ This field is required.")
+            continue
+        if cast:
+            try:
+                return cast(value)
+            except (ValueError, TypeError):
+                print(f"  ✗ Invalid value, expected {cast.__name__}.")
+                continue
+        return value
+
+
+# ──────────────────────────────────────────────────────────────
+# Template discovery (LXC)
 # ──────────────────────────────────────────────────────────────
 
 def list_templates(proxmox, node):
@@ -326,19 +384,266 @@ def _handle_template_upload(proxmox, node, host, token_id, token_secret):
 
 
 # ──────────────────────────────────────────────────────────────
+# ISO discovery (VMs)
+# ──────────────────────────────────────────────────────────────
+
+def list_isos(proxmox, node):
+    """
+    Return a list of available ISO images across all storage pools
+    on the given node.
+
+    Each item is a dict with keys: volid, storage, filename, size.
+    """
+    isos = []
+    storages = proxmox.nodes(node).storage.get()
+
+    for store in storages:
+        storage_name = store["storage"]
+        try:
+            content = proxmox.nodes(node).storage(storage_name).content.get()
+            for item in content:
+                if item.get("content") == "iso":
+                    isos.append({
+                        "volid": item["volid"],
+                        "storage": storage_name,
+                        "filename": item["volid"].split("/")[-1],
+                        "size": item.get("size", 0),
+                    })
+        except Exception:
+            continue
+
+    return isos
+
+
+def list_iso_storages(proxmox, node):
+    """
+    Return a list of storage pools that accept 'iso' content.
+
+    These are the storages where ISO files can be uploaded.
+    """
+    eligible = []
+    storages = proxmox.nodes(node).storage.get()
+
+    for store in storages:
+        content_types = store.get("content", "")
+        if "iso" in content_types:
+            eligible.append(store)
+
+    return eligible
+
+
+def pick_iso_storage(proxmox, node):
+    """
+    Let the user pick a storage pool to upload the ISO to.
+
+    Only storages that accept iso content are listed.
+    """
+    eligible = list_iso_storages(proxmox, node)
+
+    if not eligible:
+        print("\n  ✗ No storage pools accept ISO uploads.")
+        print("    Configure a storage pool with 'iso' content type.\n")
+        return None
+
+    if len(eligible) == 1:
+        selected = eligible[0]["storage"]
+        print(f"\n  ✓ Upload target: {selected} (only eligible storage)\n")
+        return selected
+
+    print("\n┌─────────────────────────────────────────────┐")
+    print("│        Storage Pools for ISO Upload         │")
+    print("└─────────────────────────────────────────────┘")
+
+    for idx, store in enumerate(eligible, start=1):
+        total_gb = store.get("total", 0) / (1024 ** 3)
+        avail_gb = store.get("avail", 0) / (1024 ** 3)
+        print(f"  [{idx:>2}]  {store['storage']}")
+        print(f"        type: {store.get('type', '?')}  |  "
+              f"total: {total_gb:.1f} GB  |  free: {avail_gb:.1f} GB")
+
+    while True:
+        choice = input("\n  Select a storage pool for upload: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(eligible):
+            selected = eligible[int(choice) - 1]["storage"]
+            print(f"\n  ✓ Upload target: {selected}\n")
+            return selected
+        print("  ✗ Invalid selection, try again.")
+
+
+def validate_iso_path(filepath):
+    """Validate that the file exists and has a supported ISO extension."""
+    if not os.path.isfile(filepath):
+        return False, f"File not found: {filepath}"
+
+    if not any(filepath.lower().endswith(ext) for ext in ISO_EXTENSIONS):
+        return False, (
+            f"Unsupported file type. "
+            f"Expected one of: {', '.join(ISO_EXTENSIONS)}"
+        )
+
+    return True, None
+
+
+def upload_iso(proxmox, node, host, token_id, token_secret, filepath,
+               storage):
+    """
+    Upload a local ISO file to a Proxmox storage pool.
+
+    Uses the Proxmox REST API multipart upload endpoint:
+        POST /nodes/{node}/storage/{storage}/upload
+
+    Returns an ISO dict compatible with pick_iso output.
+    """
+    filename = os.path.basename(filepath)
+    file_size = os.path.getsize(filepath)
+    size_mb = file_size / (1024 * 1024)
+
+    print(f"  ⟳ Uploading {filename} ({size_mb:.1f} MB) to '{storage}' …")
+
+    upload_url = (
+        f"https://{host}/api2/json/nodes/{node}"
+        f"/storage/{storage}/upload"
+    )
+    headers = {
+        "Authorization": f"PVEAPIToken={token_id}={token_secret}",
+    }
+
+    content_type = mimetypes.guess_type(filepath)[0] or "application/octet-stream"
+
+    try:
+        with open(filepath, "rb") as fh:
+            files = {
+                "filename": (filename, fh, content_type),
+            }
+            data = {
+                "content": "iso",
+            }
+            response = requests.post(
+                upload_url,
+                headers=headers,
+                files=files,
+                data=data,
+                verify=False,
+            )
+            response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        print(f"\n  ✗ Upload failed: {exc}\n")
+        return None
+
+    result = response.json()
+    task_id = result.get("data")
+    if task_id:
+        print(f"  ⟳ Upload task started: {task_id}")
+        try:
+            wait_for_task(proxmox, node, task_id, timeout=600)
+        except Exception as exc:
+            print(f"\n  ✗ Upload task failed: {exc}\n")
+            return None
+
+    print(f"  ✓ ISO uploaded successfully!\n")
+
+    volid = f"{storage}:iso/{filename}"
+    return {
+        "volid": volid,
+        "storage": storage,
+        "filename": filename,
+        "size": file_size,
+    }
+
+
+def pick_iso(proxmox, node, host, token_id, token_secret, isos):
+    """
+    Display a numbered list of ISOs and let the user choose one,
+    or upload a custom ISO from a local file.
+    """
+    print("\n┌─────────────────────────────────────────────┐")
+    print("│           Available ISO Images              │")
+    print("└─────────────────────────────────────────────┘")
+
+    if isos:
+        for idx, iso in enumerate(isos, start=1):
+            size_mb = iso["size"] / (1024 * 1024) if iso["size"] else 0
+            print(f"  [{idx:>2}]  {iso['filename']}")
+            print(f"        storage: {iso['storage']}  |  size: {size_mb:.1f} MB")
+    else:
+        print("\n  (no existing ISOs found on this node)")
+
+    upload_idx = len(isos) + 1
+    print(f"\n  [{upload_idx:>2}]  ⬆  Upload an ISO from local file")
+
+    while True:
+        choice = input("\n  Select an ISO number: ").strip()
+        if not choice.isdigit():
+            print("  ✗ Invalid selection, try again.")
+            continue
+
+        idx = int(choice)
+        if 1 <= idx <= len(isos):
+            selected = isos[idx - 1]
+            print(f"\n  ✓ Selected: {selected['filename']}\n")
+            return selected
+        elif idx == upload_idx:
+            return _handle_iso_upload(
+                proxmox, node, host, token_id, token_secret
+            )
+        else:
+            print("  ✗ Invalid selection, try again.")
+
+
+def _handle_iso_upload(proxmox, node, host, token_id, token_secret):
+    """Prompt for a local ISO file path and upload it."""
+    print("\n  ── Upload ISO Image ──")
+    print(f"  Supported formats: {', '.join(ISO_EXTENSIONS)}\n")
+
+    while True:
+        filepath = input("  Path to ISO file: ").strip()
+        filepath = filepath.strip('"').strip("'")
+        filepath = os.path.expanduser(filepath)
+        filepath = os.path.abspath(filepath)
+
+        valid, err = validate_iso_path(filepath)
+        if valid:
+            break
+        print(f"  ✗ {err}")
+
+    storage = pick_iso_storage(proxmox, node)
+    if storage is None:
+        print("  ✗ Cannot upload ISO — no eligible storage pools.\n")
+        return None
+
+    iso = upload_iso(
+        proxmox, node, host, token_id, token_secret, filepath, storage
+    )
+    return iso
+
+
+# ──────────────────────────────────────────────────────────────
 # Storage discovery
 # ──────────────────────────────────────────────────────────────
 
-def pick_storage(proxmox, node):
-    """List storage pools that accept rootdir/images and let the user pick one."""
+def pick_storage(proxmox, node, content_filter=None):
+    """
+    List storage pools and let the user pick one.
+
+    Args:
+        proxmox: ProxmoxAPI handle.
+        node: Proxmox node name.
+        content_filter: Optional content type to filter by
+                        (e.g. 'rootdir', 'images'). If None, filters
+                        by 'rootdir' or 'images' with a fallback to all.
+    """
     storages = proxmox.nodes(node).storage.get()
 
-    # Filter storages that can hold rootdir or container images
+    # Filter storages by content type
     eligible = []
     for store in storages:
         content_types = store.get("content", "")
-        if "rootdir" in content_types or "images" in content_types:
-            eligible.append(store)
+        if content_filter:
+            if content_filter in content_types:
+                eligible.append(store)
+        else:
+            if "rootdir" in content_types or "images" in content_types:
+                eligible.append(store)
 
     if not eligible:
         # Fallback: show all storages and let the user decide
@@ -365,39 +670,8 @@ def pick_storage(proxmox, node):
 
 
 # ──────────────────────────────────────────────────────────────
-# Next available VMID
+# LXC container creation (from template)
 # ──────────────────────────────────────────────────────────────
-
-def next_vmid(proxmox):
-    """Ask the cluster for the next available VMID."""
-    try:
-        return proxmox.cluster.nextid.get()
-    except Exception:
-        return 100  # fallback
-
-
-# ──────────────────────────────────────────────────────────────
-# Interactive container configuration
-# ──────────────────────────────────────────────────────────────
-
-def prompt_value(label, default=None, required=False, cast=None):
-    """Prompt the user for a value with an optional default."""
-    suffix = f" [{default}]" if default is not None else ""
-    while True:
-        value = input(f"  {label}{suffix}: ").strip()
-        if not value and default is not None:
-            value = str(default)
-        if required and not value:
-            print("  ✗ This field is required.")
-            continue
-        if cast:
-            try:
-                return cast(value)
-            except (ValueError, TypeError):
-                print(f"  ✗ Invalid value, expected {cast.__name__}.")
-                continue
-        return value
-
 
 def configure_container(proxmox, node):
     """Interactively collect all settings for the new container."""
@@ -471,10 +745,6 @@ def configure_container(proxmox, node):
     }
     return config
 
-
-# ──────────────────────────────────────────────────────────────
-# Container creation
-# ──────────────────────────────────────────────────────────────
 
 def confirm_and_create(proxmox, node, template, storage, config):
     """Show a summary and create the container upon confirmation."""
@@ -558,26 +828,8 @@ def confirm_and_create(proxmox, node, template, storage, config):
             print(f"  ⚠ Failed to start container: {exc}\n")
 
 
-def wait_for_task(proxmox, node, task_id, timeout=120, interval=2):
-    """Poll a Proxmox task until it completes or times out."""
-    elapsed = 0
-    while elapsed < timeout:
-        status = proxmox.nodes(node).tasks(task_id).status.get()
-        if status.get("status") == "stopped":
-            if status.get("exitstatus") == "OK":
-                return
-            else:
-                raise RuntimeError(
-                    f"Task exited with status: {status.get('exitstatus')}"
-                )
-        time.sleep(interval)
-        elapsed += interval
-
-    raise TimeoutError(f"Task {task_id} did not complete within {timeout}s")
-
-
 # ──────────────────────────────────────────────────────────────
-# Container listing & deletion
+# LXC container cloning
 # ──────────────────────────────────────────────────────────────
 
 def list_containers(proxmox, node):
@@ -593,6 +845,406 @@ def list_containers(proxmox, node):
         print(f"\n  ✗ Failed to list containers: {exc}\n")
         return []
 
+
+def pick_clone_source(proxmox, node):
+    """
+    Display all LXC containers and let the user pick one to clone.
+
+    Returns the selected container dict, or None if cancelled.
+    """
+    containers = list_containers(proxmox, node)
+
+    print("\n┌─────────────────────────────────────────────┐")
+    print("│       LXC Containers Available to Clone     │")
+    print("└─────────────────────────────────────────────┘")
+
+    if not containers:
+        print("\n  (no containers found on this node)\n")
+        return None
+
+    # Sort by VMID for consistent ordering
+    containers = sorted(containers, key=lambda c: int(c.get("vmid", 0)))
+
+    for idx, ct in enumerate(containers, start=1):
+        vmid = ct.get("vmid", "?")
+        name = ct.get("name", "(unnamed)")
+        status = ct.get("status", "unknown")
+        cpus = ct.get("cpus", "?")
+        mem_mb = int(ct.get("maxmem", 0)) / (1024 * 1024)
+        status_icon = "🟢" if status == "running" else "⚫"
+        print(f"  [{idx:>2}]  {status_icon}  CT {vmid} — {name}")
+        print(f"        status: {status}  |  cpus: {cpus}  |  "
+              f"memory: {mem_mb:.0f} MB")
+
+    while True:
+        choice = input("\n  Select a container to clone (or 'q' to cancel): ").strip()
+        if choice.lower() in ("q", "quit", "cancel"):
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(containers):
+            selected = containers[int(choice) - 1]
+            vmid = selected.get("vmid", "?")
+            name = selected.get("name", "(unnamed)")
+            print(f"\n  ✓ Clone source: CT {vmid} — {name}\n")
+            return selected
+        print("  ✗ Invalid selection, try again.")
+
+
+def configure_clone(proxmox, node, source):
+    """
+    Interactively collect settings for cloning an LXC container.
+
+    Args:
+        proxmox: ProxmoxAPI handle.
+        node: Proxmox node name.
+        source: Source container dict (must have 'vmid' and 'name').
+
+    Returns a config dict for the clone operation.
+    """
+    suggested_id = next_vmid(proxmox)
+    source_vmid = source.get("vmid", "?")
+    source_name = source.get("name", "(unnamed)")
+
+    print("┌─────────────────────────────────────────────┐")
+    print("│          Clone Configuration                │")
+    print("└─────────────────────────────────────────────┘")
+    print(f"\n  Source: CT {source_vmid} — {source_name}\n")
+
+    new_vmid = prompt_value("New Container ID (VMID)", default=suggested_id, cast=int)
+    hostname = prompt_value("New hostname", default=f"{source_name}-clone")
+
+    # Full or linked clone
+    print("\n  ── Clone Type ──")
+    print("  Full clone:   Independent copy (uses more disk space)")
+    print("  Linked clone: Shares base image (faster, less disk)\n")
+    clone_type = prompt_value("Clone type (full/linked)", default="full")
+    full_clone = 1 if clone_type.lower() in ("full", "f") else 0
+
+    # Target storage (only relevant for full clones)
+    target_storage = None
+    if full_clone:
+        print("\n  ── Target Storage for Clone ──")
+        use_custom = prompt_value(
+            "Use a different storage for the clone? (y/n)", default="n"
+        )
+        if use_custom.lower() in ("y", "yes"):
+            target_storage = pick_storage(proxmox, node)
+
+    # Description
+    description = prompt_value(
+        "Description (optional)",
+        default=f"Clone of CT {source_vmid} ({source_name})"
+    )
+
+    # Start after clone?
+    start_input = prompt_value("Start container after cloning? (y/n)", default="n")
+    start_after = start_input.lower() in ("y", "yes")
+
+    config = {
+        "new_vmid": new_vmid,
+        "hostname": hostname,
+        "full_clone": full_clone,
+        "target_storage": target_storage,
+        "description": description,
+        "start_after": start_after,
+    }
+    return config
+
+
+def confirm_and_clone(proxmox, node, source, config):
+    """Show a summary and execute the LXC clone upon confirmation."""
+    source_vmid = source.get("vmid", "?")
+    source_name = source.get("name", "(unnamed)")
+
+    clone_type_label = "Full" if config["full_clone"] else "Linked"
+    storage_label = config["target_storage"] or "(same as source)"
+
+    summary = textwrap.dedent(f"""
+    ┌─────────────────────────────────────────────┐
+    │              Clone Summary                   │
+    └─────────────────────────────────────────────┘
+
+      Source:         CT {source_vmid} — {source_name}
+      New VMID:       {config['new_vmid']}
+      New hostname:   {config['hostname']}
+      Clone type:     {clone_type_label}
+      Target storage: {storage_label}
+      Description:    {config['description']}
+      Start after:    {'Yes' if config['start_after'] else 'No'}
+      Node:           {node}
+    """)
+    print(summary)
+
+    confirm = input("  Proceed with clone? (y/n): ").strip().lower()
+    if confirm not in ("y", "yes"):
+        print("\n  ✗ Aborted.\n")
+        return
+
+    # Build the API payload
+    payload = {
+        "newid": config["new_vmid"],
+        "hostname": config["hostname"],
+        "full": config["full_clone"],
+        "description": config["description"],
+    }
+    if config["target_storage"]:
+        payload["storage"] = config["target_storage"]
+
+    print("\n  ⟳ Cloning container …")
+
+    try:
+        task_id = proxmox.nodes(node).lxc(source_vmid).clone.post(**payload)
+        print(f"  ✓ Task started: {task_id}")
+    except Exception as exc:
+        print(f"\n  ✗ Failed to clone container: {exc}\n")
+        return
+
+    # Wait for the task to finish
+    print("  ⟳ Waiting for clone to complete …")
+    try:
+        wait_for_task(proxmox, node, task_id, timeout=300)
+    except Exception as exc:
+        print(f"\n  ⚠ Could not verify task completion: {exc}")
+        print("    Check the Proxmox UI for task status.\n")
+        return
+
+    print(f"  ✓ Container {config['new_vmid']} cloned successfully!\n")
+
+    # Optionally start the cloned container
+    if config["start_after"]:
+        print("  ⟳ Starting cloned container …")
+        try:
+            proxmox.nodes(node).lxc(config["new_vmid"]).status.start.post()
+            print(f"  ✓ Container {config['new_vmid']} is now running.\n")
+        except Exception as exc:
+            print(f"  ⚠ Failed to start container: {exc}\n")
+
+
+# ──────────────────────────────────────────────────────────────
+# VM creation (from ISO)
+# ──────────────────────────────────────────────────────────────
+
+# Common OS types for the Proxmox 'ostype' parameter
+OS_TYPES = [
+    ("l26",      "Linux 2.6 – 6.x kernel"),
+    ("l24",      "Linux 2.4 kernel"),
+    ("win11",    "Windows 11 / Server 2025"),
+    ("win10",    "Windows 10 / Server 2016–2022"),
+    ("win8",     "Windows 8 / Server 2012"),
+    ("win7",     "Windows 7 / Server 2008 R2"),
+    ("wxp",      "Windows XP / Server 2003"),
+    ("solaris",  "Solaris / OpenSolaris"),
+    ("other",    "Other / Unspecified"),
+]
+
+
+def configure_vm(proxmox, node):
+    """
+    Interactively collect all settings for the new virtual machine.
+
+    Returns a config dict with all VM parameters.
+    """
+    suggested_id = next_vmid(proxmox)
+
+    print("┌─────────────────────────────────────────────┐")
+    print("│       New Virtual Machine Configuration     │")
+    print("└─────────────────────────────────────────────┘\n")
+
+    vmid = prompt_value("VM ID (VMID)", default=suggested_id, cast=int)
+    name = prompt_value("VM name", required=True)
+
+    # OS type
+    print("\n  ── OS Type ──")
+    for idx, (key, label) in enumerate(OS_TYPES, start=1):
+        print(f"  [{idx:>2}]  {label}  ({key})")
+
+    while True:
+        os_choice = input("\n  Select OS type [1]: ").strip() or "1"
+        if os_choice.isdigit() and 1 <= int(os_choice) <= len(OS_TYPES):
+            ostype = OS_TYPES[int(os_choice) - 1][0]
+            print(f"  ✓ OS type: {ostype}\n")
+            break
+        print("  ✗ Invalid selection, try again.")
+
+    # BIOS type
+    print("  ── BIOS Type ──")
+    print("  [1]  SeaBIOS (legacy BIOS — most compatible)")
+    print("  [2]  OVMF (UEFI — required for some modern OSes)\n")
+    bios_choice = prompt_value("BIOS type", default="1")
+    bios = "ovmf" if bios_choice in ("2", "ovmf", "uefi") else "seabios"
+    print(f"  ✓ BIOS: {bios}\n")
+
+    # CPU & Memory
+    sockets = prompt_value("CPU sockets", default=1, cast=int)
+    cores = prompt_value("CPU cores per socket", default=2, cast=int)
+    cpu_type = prompt_value("CPU type", default="host")
+    memory = prompt_value("Memory (MB)", default=2048, cast=int)
+    balloon = prompt_value("Balloon memory minimum (MB, 0 to disable)",
+                           default=0, cast=int)
+
+    # Disk
+    disk_size = prompt_value("Disk size (GB)", default=32, cast=int)
+
+    # SCSI controller type
+    print("\n  ── SCSI Controller ──")
+    print("  [1]  VirtIO SCSI Single (recommended)")
+    print("  [2]  VirtIO SCSI")
+    print("  [3]  LSI 53C895A (legacy)\n")
+    scsi_choice = prompt_value("SCSI controller", default="1")
+    if scsi_choice in ("2", "virtio-scsi-pci"):
+        scsihw = "virtio-scsi-pci"
+    elif scsi_choice in ("3", "lsi"):
+        scsihw = "lsi"
+    else:
+        scsihw = "virtio-scsi-single"
+    print(f"  ✓ SCSI controller: {scsihw}\n")
+
+    # Networking
+    print("  ── Network Configuration ──\n")
+    net_model = prompt_value("Network adapter model", default="virtio")
+    bridge = prompt_value("Bridge interface", default="vmbr0")
+    firewall = prompt_value("Enable firewall? (y/n)", default="n")
+    fw_flag = 1 if firewall.lower() in ("y", "yes") else 0
+
+    # VGA
+    vga = prompt_value("Display type (std/virtio/vmware/qxl/none)",
+                       default="std")
+
+    # Boot order
+    print("\n  ── Boot Order ──")
+    print("  The VM will try to boot from the ISO (CD-ROM) first,")
+    print("  then fall back to the primary disk.\n")
+
+    # Start on boot?
+    onboot_input = prompt_value("Start on boot? (y/n)", default="n")
+    onboot = 1 if onboot_input.lower() in ("y", "yes") else 0
+
+    # Start after creation?
+    start_input = prompt_value("Start VM after creation? (y/n)", default="y")
+    start_after = start_input.lower() in ("y", "yes")
+
+    # QEMU agent
+    agent_input = prompt_value("Enable QEMU Guest Agent? (y/n)", default="y")
+    agent = 1 if agent_input.lower() in ("y", "yes") else 0
+
+    config = {
+        "vmid": vmid,
+        "name": name,
+        "ostype": ostype,
+        "bios": bios,
+        "sockets": sockets,
+        "cores": cores,
+        "cpu_type": cpu_type,
+        "memory": memory,
+        "balloon": balloon,
+        "disk_size": disk_size,
+        "scsihw": scsihw,
+        "net_model": net_model,
+        "bridge": bridge,
+        "firewall": fw_flag,
+        "vga": vga,
+        "onboot": onboot,
+        "start_after": start_after,
+        "agent": agent,
+    }
+    return config
+
+
+def confirm_and_create_vm(proxmox, node, iso, storage, config):
+    """Show a summary and create the VM upon confirmation."""
+
+    summary = textwrap.dedent(f"""
+    ┌─────────────────────────────────────────────┐
+    │            Virtual Machine Summary           │
+    └─────────────────────────────────────────────┘
+
+      VMID:           {config['vmid']}
+      Name:           {config['name']}
+      OS type:        {config['ostype']}
+      BIOS:           {config['bios']}
+      ISO:            {iso['filename']}
+      Storage:        {storage}
+      CPU:            {config['sockets']} socket(s) × {config['cores']} core(s)  [{config['cpu_type']}]
+      Memory:         {config['memory']} MB
+      Balloon:        {config['balloon']} MB
+      Disk:           {config['disk_size']} GB
+      SCSI:           {config['scsihw']}
+      Network:        {config['net_model']}, bridge={config['bridge']}
+      Firewall:       {'Yes' if config['firewall'] else 'No'}
+      Display:        {config['vga']}
+      QEMU agent:     {'Yes' if config['agent'] else 'No'}
+      On boot:        {'Yes' if config['onboot'] else 'No'}
+      Start after:    {'Yes' if config['start_after'] else 'No'}
+      Node:           {node}
+    """)
+    print(summary)
+
+    confirm = input("  Proceed with VM creation? (y/n): ").strip().lower()
+    if confirm not in ("y", "yes"):
+        print("\n  ✗ Aborted.\n")
+        return
+
+    # Build the API payload
+    net0 = f"{config['net_model']},bridge={config['bridge']}"
+    if config["firewall"]:
+        net0 += ",firewall=1"
+
+    payload = {
+        "vmid": config["vmid"],
+        "name": config["name"],
+        "ostype": config["ostype"],
+        "bios": config["bios"],
+        "sockets": config["sockets"],
+        "cores": config["cores"],
+        "cpu": config["cpu_type"],
+        "memory": config["memory"],
+        "balloon": config["balloon"],
+        "scsihw": config["scsihw"],
+        "scsi0": f"{storage}:{config['disk_size']}",
+        "ide2": f"{iso['volid']},media=cdrom",
+        "net0": net0,
+        "vga": config["vga"],
+        "onboot": config["onboot"],
+        "agent": config["agent"],
+        "boot": "order=ide2;scsi0",
+    }
+
+    # Add EFI disk if using OVMF
+    if config["bios"] == "ovmf":
+        payload["efidisk0"] = f"{storage}:1"
+
+    print("\n  ⟳ Creating virtual machine …")
+
+    try:
+        task_id = proxmox.nodes(node).qemu.create(**payload)
+        print(f"  ✓ Task started: {task_id}")
+    except Exception as exc:
+        print(f"\n  ✗ Failed to create VM: {exc}\n")
+        return
+
+    # Wait for the task to finish
+    print("  ⟳ Waiting for task to complete …")
+    try:
+        wait_for_task(proxmox, node, task_id)
+    except Exception as exc:
+        print(f"\n  ⚠ Could not verify task completion: {exc}")
+        print("    Check the Proxmox UI for task status.\n")
+        return
+
+    print(f"  ✓ VM {config['vmid']} created successfully!\n")
+
+    # Optionally start the VM
+    if config["start_after"]:
+        print("  ⟳ Starting virtual machine …")
+        try:
+            proxmox.nodes(node).qemu(config["vmid"]).status.start.post()
+            print(f"  ✓ VM {config['vmid']} is now running.\n")
+        except Exception as exc:
+            print(f"  ⚠ Failed to start VM: {exc}\n")
+
+
+# ──────────────────────────────────────────────────────────────
+# Container listing & deletion
+# ──────────────────────────────────────────────────────────────
 
 def pick_containers_to_delete(containers):
     """
@@ -725,27 +1377,159 @@ def delete_containers(proxmox, node):
 
 
 # ──────────────────────────────────────────────────────────────
-# Main menu & entry point
+# VM listing & deletion
 # ──────────────────────────────────────────────────────────────
 
-def main_menu():
-    """Display the main menu and return the user's choice."""
-    print("┌─────────────────────────────────────────────┐")
-    print("│               Main Menu                     │")
+def list_vms(proxmox, node):
+    """
+    Return a list of all QEMU VMs on the given node.
+
+    Each item is a dict with keys from the Proxmox API, including:
+    vmid, name, status, mem, maxmem, disk, maxdisk, cpus, etc.
+    """
+    try:
+        return proxmox.nodes(node).qemu.get()
+    except Exception as exc:
+        print(f"\n  ✗ Failed to list VMs: {exc}\n")
+        return []
+
+
+def pick_vms_to_delete(vms):
+    """
+    Display all QEMU VMs and let the user pick one or more to delete.
+
+    Returns a list of selected VM dicts.
+    """
+    print("\n┌─────────────────────────────────────────────┐")
+    print("│          QEMU VMs on This Node              │")
     print("└─────────────────────────────────────────────┘")
-    print("  [1]  Create a new LXC container")
-    print("  [2]  Delete existing LXC container(s)")
-    print("  [3]  Exit")
+
+    if not vms:
+        print("\n  (no VMs found on this node)\n")
+        return []
+
+    # Sort by VMID for consistent ordering
+    vms = sorted(vms, key=lambda v: int(v.get("vmid", 0)))
+
+    for idx, vm in enumerate(vms, start=1):
+        vmid = vm.get("vmid", "?")
+        name = vm.get("name", "(unnamed)")
+        status = vm.get("status", "unknown")
+        cpus = vm.get("cpus", "?")
+        mem_mb = int(vm.get("maxmem", 0)) / (1024 * 1024)
+        status_icon = "🟢" if status == "running" else "⚫"
+        print(f"  [{idx:>2}]  {status_icon}  VM {vmid} — {name}")
+        print(f"        status: {status}  |  cpus: {cpus}  |  "
+              f"memory: {mem_mb:.0f} MB")
+
+    print(f"\n  Enter VM numbers to delete (comma-separated),")
+    print(f"  or 'all' to select all, or 'q' to cancel.")
 
     while True:
-        choice = input("\n  Select an option: ").strip()
-        if choice in ("1", "2", "3"):
-            return choice
+        choice = input("\n  Selection: ").strip().lower()
+
+        if choice in ("q", "quit", "cancel"):
+            return []
+
+        if choice == "all":
+            return list(vms)
+
+        # Parse comma-separated numbers
+        parts = [p.strip() for p in choice.split(",")]
+        selected = []
+        valid = True
+        for part in parts:
+            if not part.isdigit():
+                valid = False
+                break
+            idx = int(part)
+            if 1 <= idx <= len(vms):
+                selected.append(vms[idx - 1])
+            else:
+                valid = False
+                break
+
+        if valid and selected:
+            return selected
+
         print("  ✗ Invalid selection, try again.")
 
 
-def create_flow(proxmox, node, host, token_id, token_secret):
-    """Run the interactive container-creation workflow."""
+def delete_vms(proxmox, node):
+    """
+    Interactive flow to list, select, and delete QEMU VMs.
+
+    Running VMs are stopped before deletion.
+    """
+    vms = list_vms(proxmox, node)
+    if not vms:
+        return
+
+    selected = pick_vms_to_delete(vms)
+    if not selected:
+        print("\n  ✗ No VMs selected. Returning to menu.\n")
+        return
+
+    # Confirmation summary
+    print("\n┌─────────────────────────────────────────────┐")
+    print("│            VMs Marked for Deletion           │")
+    print("└─────────────────────────────────────────────┘")
+
+    for vm in selected:
+        vmid = vm.get("vmid", "?")
+        name = vm.get("name", "(unnamed)")
+        status = vm.get("status", "unknown")
+        print(f"  • VM {vmid} — {name}  ({status})")
+
+    running = [vm for vm in selected if vm.get("status") == "running"]
+    if running:
+        print(f"\n  ⚠  {len(running)} VM(s) are currently running "
+              f"and will be stopped first.")
+
+    confirm = input("\n  ⚠  This action is IRREVERSIBLE. "
+                    "Proceed with deletion? (yes/no): ").strip().lower()
+    if confirm not in ("yes",):
+        print("\n  ✗ Aborted.\n")
+        return
+
+    # Process each VM
+    for vm in selected:
+        vmid = vm.get("vmid")
+        name = vm.get("name", "(unnamed)")
+        status = vm.get("status", "unknown")
+
+        print(f"\n  ── VM {vmid} ({name}) ──")
+
+        # Stop the VM if it's running
+        if status == "running":
+            print(f"  ⟳ Stopping VM {vmid} …")
+            try:
+                task_id = proxmox.nodes(node).qemu(vmid).status.stop.post()
+                wait_for_task(proxmox, node, task_id)
+                print(f"  ✓ VM {vmid} stopped.")
+            except Exception as exc:
+                print(f"  ✗ Failed to stop VM {vmid}: {exc}")
+                print(f"    Skipping deletion of {vmid}.")
+                continue
+
+        # Delete the VM
+        print(f"  ⟳ Deleting VM {vmid} …")
+        try:
+            task_id = proxmox.nodes(node).qemu(vmid).delete()
+            wait_for_task(proxmox, node, task_id)
+            print(f"  ✓ VM {vmid} deleted successfully!")
+        except Exception as exc:
+            print(f"  ✗ Failed to delete VM {vmid}: {exc}")
+
+    print()
+
+
+# ──────────────────────────────────────────────────────────────
+# Workflow orchestrators
+# ──────────────────────────────────────────────────────────────
+
+def create_lxc_flow(proxmox, node, host, token_id, token_secret):
+    """Run the interactive LXC container-creation workflow."""
     # Pick a template (existing or upload a custom one)
     templates = list_templates(proxmox, node)
     template = pick_template(
@@ -762,9 +1546,73 @@ def create_flow(proxmox, node, host, token_id, token_secret):
     confirm_and_create(proxmox, node, template, storage, config)
 
 
+def clone_lxc_flow(proxmox, node):
+    """Run the interactive LXC clone workflow."""
+    # Pick a source container
+    source = pick_clone_source(proxmox, node)
+    if source is None:
+        print("  ✗ No clone source selected. Returning to menu.\n")
+        return
+
+    # Configure the clone
+    config = configure_clone(proxmox, node, source)
+
+    # Confirm and clone
+    confirm_and_clone(proxmox, node, source, config)
+
+
+def create_vm_flow(proxmox, node, host, token_id, token_secret):
+    """Run the interactive VM-creation workflow."""
+    # Pick an ISO (existing or upload one)
+    isos = list_isos(proxmox, node)
+    iso = pick_iso(proxmox, node, host, token_id, token_secret, isos)
+
+    if iso is None:
+        print("  ✗ No ISO selected. Returning to menu.\n")
+        return
+
+    # Pick storage for the VM disk
+    print("  ── VM Disk Storage ──\n")
+    storage = pick_storage(proxmox, node, content_filter="images")
+
+    # Configure the new VM
+    config = configure_vm(proxmox, node)
+
+    # Confirm and create
+    confirm_and_create_vm(proxmox, node, iso, storage, config)
+
+
+# ──────────────────────────────────────────────────────────────
+# Main menu & entry point
+# ──────────────────────────────────────────────────────────────
+
+def main_menu():
+    """Display the main menu and return the user's choice."""
+    print("┌─────────────────────────────────────────────┐")
+    print("│               Main Menu                     │")
+    print("├─────────────────────────────────────────────┤")
+    print("│  LXC Containers                             │")
+    print("│  [1]  Create LXC from template              │")
+    print("│  [2]  Clone an existing LXC container       │")
+    print("│  [3]  Delete LXC container(s)               │")
+    print("├─────────────────────────────────────────────┤")
+    print("│  Virtual Machines                           │")
+    print("│  [4]  Create VM from ISO                    │")
+    print("│  [5]  Delete VM(s)                          │")
+    print("├─────────────────────────────────────────────┤")
+    print("│  [6]  Exit                                  │")
+    print("└─────────────────────────────────────────────┘")
+
+    while True:
+        choice = input("\n  Select an option: ").strip()
+        if choice in ("1", "2", "3", "4", "5", "6"):
+            return choice
+        print("  ✗ Invalid selection, try again.")
+
+
 def main():
     print("\n" + "═" * 50)
-    print("  Proxmox LXC Manager — Target node: pmx-4")
+    print("  Proxmox VM & LXC Manager — Target node: pmx-4")
     print("═" * 50)
 
     # Load config & connect
@@ -777,10 +1625,16 @@ def main():
         choice = main_menu()
 
         if choice == "1":
-            create_flow(proxmox, node, host, token_id, token_secret)
+            create_lxc_flow(proxmox, node, host, token_id, token_secret)
         elif choice == "2":
-            delete_containers(proxmox, node)
+            clone_lxc_flow(proxmox, node)
         elif choice == "3":
+            delete_containers(proxmox, node)
+        elif choice == "4":
+            create_vm_flow(proxmox, node, host, token_id, token_secret)
+        elif choice == "5":
+            delete_vms(proxmox, node)
+        elif choice == "6":
             print("\n  Goodbye!\n")
             break
 
