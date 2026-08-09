@@ -1,6 +1,6 @@
 # Proxmox API Token Setup
 
-This guide explains how to create an API token in Proxmox VE for use with the LXC creator script.
+This guide explains how to create an API token in Proxmox VE for use with the LXC manager script.
 
 ---
 
@@ -36,10 +36,10 @@ https://<your-proxmox-host>:8006
 | Field            | Value                    | Notes                                                            |
 |------------------|--------------------------|------------------------------------------------------------------|
 | **User**         | `root@pam`               | Or any user with sufficient privileges                           |
-| **Token ID**     | `lxc-creator`            | A descriptive name for this token                                |
+| **Token ID**     | `lxc-manager`            | A descriptive name for this token                                |
 | **Privilege Separation** | ☐ Unchecked      | When unchecked, the token inherits all of the user's privileges  |
 | **Expire**       | *(leave blank)*          | Optional — set an expiry date if desired                         |
-| **Comment**      | `LXC creation script`    | Optional                                                         |
+| **Comment**      | `LXC manager script`     | Optional                                                         |
 
 > **Important:** If you check "Privilege Separation", you'll need to explicitly assign permissions to the token. For simplicity, leave it unchecked to inherit the user's permissions.
 
@@ -48,7 +48,7 @@ https://<your-proxmox-host>:8006
 After clicking **Add**, Proxmox displays the token secret **once**. Copy it immediately.
 
 ```
-Token ID:     root@pam!lxc-creator
+Token ID:     root@pam!lxc-manager
 Token Secret: aabbccdd-1122-3344-5566-778899aabbcc
 ```
 
@@ -60,7 +60,7 @@ Open your `.env` file and fill in the values:
 
 ```dotenv
 PROXMOX_HOST=https://192.168.1.50:8006
-PROXMOX_TOKEN_ID=root@pam!lxc-creator
+PROXMOX_TOKEN_ID=root@pam!lxc-manager
 PROXMOX_TOKEN_SECRET=aabbccdd-1122-3344-5566-778899aabbcc
 PROXMOX_NODE=pmx-4
 ```
@@ -73,7 +73,7 @@ You can also create tokens from the Proxmox host command line:
 
 ```bash
 # Create the token (returns the secret)
-pveum user token add root@pam lxc-creator --privsep 0
+pveum user token add root@pam lxc-manager --privsep 0
 
 # Verify it was created
 pveum user token list root@pam
@@ -89,7 +89,7 @@ If using privilege separation (or a non-root user), the token needs the followin
 
 | Permission             | Path                     | Purpose                           |
 |------------------------|--------------------------|-----------------------------------|
-| `VM.Allocate`          | `/vms`                   | Create new containers             |
+| `VM.Allocate`          | `/vms`                   | Create and delete containers      |
 | `VM.Config.Disk`       | `/vms`                   | Configure container storage       |
 | `VM.Config.CPU`        | `/vms`                   | Set CPU allocation                |
 | `VM.Config.Memory`     | `/vms`                   | Set memory allocation             |
@@ -104,9 +104,9 @@ If using privilege separation (or a non-root user), the token needs the followin
 
 ```bash
 # Example: grant all needed permissions to a token with privilege separation
-pveum aclmod /vms -token 'root@pam!lxc-creator' -role PVEVMAdmin
-pveum aclmod /storage -token 'root@pam!lxc-creator' -role PVEDatastoreUser
-pveum aclmod /nodes/pmx-4 -token 'root@pam!lxc-creator' -role PVEAuditor
+pveum aclmod /vms -token 'root@pam!lxc-manager' -role PVEVMAdmin
+pveum aclmod /storage -token 'root@pam!lxc-manager' -role PVEDatastoreUser
+pveum aclmod /nodes/pmx-4 -token 'root@pam!lxc-manager' -role PVEAuditor
 ```
 
 ---
@@ -117,7 +117,7 @@ Test the token from the command line to verify it works:
 
 ```bash
 curl -s -k \
-  -H "Authorization: PVEAPIToken=root@pam!lxc-creator=aabbccdd-1122-3344-5566-778899aabbcc" \
+  -H "Authorization: PVEAPIToken=root@pam!lxc-manager=aabbccdd-1122-3344-5566-778899aabbcc" \
   https://192.168.1.50:8006/api2/json/version | python3 -m json.tool
 ```
 

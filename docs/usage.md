@@ -1,6 +1,6 @@
 # Usage Guide
 
-This guide walks through a complete run of the LXC creator script, from launch to a running container.
+This guide walks through a complete run of the LXC manager script, covering both container creation and deletion.
 
 ---
 
@@ -10,13 +10,20 @@ This guide walks through a complete run of the LXC creator script, from launch t
 python create_lxc.py
 ```
 
-The script progresses through five interactive stages:
+After connecting to Proxmox, the script presents a **main menu**:
 
-1. **Connect** to Proxmox
-2. **Select a template**
-3. **Select a storage pool**
-4. **Configure the container**
-5. **Review and create**
+```
+┌─────────────────────────────────────────────┐
+│               Main Menu                     │
+└─────────────────────────────────────────────┘
+  [1]  Create a new LXC container
+  [2]  Delete existing LXC container(s)
+  [3]  Exit
+
+  Select an option:
+```
+
+The menu loops after each operation, so you can create and delete multiple containers in a single session.
 
 ---
 
@@ -26,7 +33,7 @@ The script loads credentials from `.env` and connects to the Proxmox API.
 
 ```
 ══════════════════════════════════════════════════
-  Proxmox LXC Creator — Target node: pmx-4
+  Proxmox LXC Manager — Target node: pmx-4
 ══════════════════════════════════════════════════
 
   ⟳ Connecting to Proxmox (192.168.1.50:8006) …
@@ -226,16 +233,88 @@ Upload a `.tar.gz`, `.tar.xz`, or `.tar.zst` template file to:
 /var/lib/vz/template/cache/
 ```
 
----
+## Creating and Deleting in One Session
 
-## Creating Multiple Containers
-
-Run the script multiple times to create additional containers. Each run will auto-suggest the next available VMID so there's no risk of ID conflicts.
+The script returns to the main menu after each operation, so you can create and delete multiple containers without restarting:
 
 ```bash
-# Create first container
 python create_lxc.py
-
-# Create another
-python create_lxc.py
+# → Select [1] to create a container
+# → After creation, you're back at the menu
+# → Select [2] to delete containers
+# → Select [3] to exit
 ```
+
+---
+
+## Deleting Containers
+
+Select option **[2]** from the main menu to enter the deletion workflow.
+
+### Step 1 — Container List
+
+All LXC containers on the node are listed with their status:
+
+```
+┌─────────────────────────────────────────────┐
+│         LXC Containers on This Node         │
+└─────────────────────────────────────────────┘
+  [ 1]  🟢  CT 100 — web-server-01
+        status: running  |  cpus: 2  |  memory: 1024 MB
+  [ 2]  🟢  CT 101 — db-server
+        status: running  |  cpus: 4  |  memory: 2048 MB
+  [ 3]  ⚫  CT 102 — test-box
+        status: stopped  |  cpus: 1  |  memory: 512 MB
+
+  Enter container numbers to delete (comma-separated),
+  or 'all' to select all, or 'q' to cancel.
+
+  Selection:
+```
+
+### Step 2 — Selection
+
+You can select containers in several ways:
+
+| Input       | Effect                              |
+|-------------|-------------------------------------|
+| `2`         | Select container #2 only            |
+| `1,3`       | Select containers #1 and #3         |
+| `all`       | Select all listed containers        |
+| `q`         | Cancel and return to the menu       |
+
+### Step 3 — Confirmation
+
+A summary of selected containers is shown. Running containers are noted:
+
+```
+┌─────────────────────────────────────────────┐
+│          Containers Marked for Deletion      │
+└─────────────────────────────────────────────┘
+  • CT 100 — web-server-01  (running)
+  • CT 102 — test-box  (stopped)
+
+  ⚠  1 container(s) are currently running and will be stopped first.
+
+  ⚠  This action is IRREVERSIBLE. Proceed with deletion? (yes/no):
+```
+
+> **Safety:** You must type the full word `yes` to proceed — `y` alone will abort. This prevents accidental deletion.
+
+### Step 4 — Deletion
+
+The script stops running containers, then deletes each one:
+
+```
+  ── CT 100 (web-server-01) ──
+  ⟳ Stopping container 100 …
+  ✓ Container 100 stopped.
+  ⟳ Deleting container 100 …
+  ✓ Container 100 deleted successfully!
+
+  ── CT 102 (test-box) ──
+  ⟳ Deleting container 102 …
+  ✓ Container 102 deleted successfully!
+```
+
+If a container fails to stop, it is skipped and an error is shown.

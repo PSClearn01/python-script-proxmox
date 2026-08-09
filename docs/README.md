@@ -1,6 +1,6 @@
-# Proxmox LXC Creator
+# Proxmox LXC Manager
 
-An interactive Python script that creates new LXC containers on a Proxmox VE node from available container templates. The script connects to the Proxmox API, discovers templates on the target node (`pmx-4`), and walks you through configuring and deploying a new container.
+An interactive Python script that creates and deletes LXC containers on a Proxmox VE node from available container templates. The script connects to the Proxmox API, discovers templates and existing containers on the target node (`pmx-4`), and walks you through configuring, deploying, or deleting containers.
 
 ---
 
@@ -26,6 +26,10 @@ An interactive Python script that creates new LXC containers on a Proxmox VE nod
 - **Auto-start** — optionally starts the container immediately after creation
 - **Secure credentials** — API token and host stored in a `.env` file, kept out of version control
 - **Smart defaults** — auto-suggests the next available VMID, sensible resource defaults
+- **Container deletion** — lists all LXC containers on the node and lets you select one or more to delete
+- **Multi-select deletion** — pick individual containers by number, select all at once, or cancel
+- **Safe deletion workflow** — automatically stops running containers before deletion, with a confirmation gate requiring `yes` to proceed
+- **Main menu** — choose between creating and deleting containers in a single session without restarting the script
 
 ---
 
@@ -83,7 +87,7 @@ cp .env.example .env
 | `PROXMOX_HOST`         | ✅       | —        | Proxmox host URL (e.g. `https://192.168.1.100:8006`)                        |
 | `PROXMOX_TOKEN_ID`     | ✅       | —        | API Token ID in `user@realm!tokenname` format                               |
 | `PROXMOX_TOKEN_SECRET` | ✅       | —        | API Token secret value                                                      |
-| `PROXMOX_NODE`         | ❌       | `pmx-4`  | Target Proxmox node name where containers will be created                   |
+| `PROXMOX_NODE`         | ❌       | `pmx-4`  | Target Proxmox node name where containers will be managed                   |
 
 ### Example `.env`
 
@@ -102,7 +106,7 @@ PROXMOX_NODE=pmx-4
 
 ```
 python-script-proxmox/
-├── create_lxc.py          # Main script
+├── create_lxc.py          # Main script — create & delete LXC containers
 ├── requirements.txt       # Python dependencies
 ├── .env.example           # Credential template (safe to commit)
 ├── .env                   # Your actual credentials (git-ignored)

@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Common issues and their solutions when using the Proxmox LXC Creator script.
+Common issues and their solutions when using the Proxmox LXC Manager script.
 
 ---
 
@@ -147,6 +147,54 @@ You can start the container manually:
 # From the Proxmox host
 pct start <VMID>
 ```
+
+---
+
+## Container Deletion Issues
+
+### ✗ Failed to stop container
+
+```
+✗ Failed to stop container <VMID>: <error>
+  Skipping deletion of <VMID>.
+```
+
+**Possible causes:**
+
+| Cause | Solution |
+|-------|----------|
+| Container is locked | Another operation (backup, snapshot) may be running. Wait for it to finish or remove the lock: `pct unlock <VMID>` |
+| Permission denied | Ensure the API token has `VM.PowerMgmt` permission. See [API Token Setup](api-token-setup.md#required-permissions) |
+| Container in an error state | Check the Proxmox UI for details. You may need to force-stop: `pct stop <VMID> --force` |
+
+---
+
+### ✗ Failed to delete container
+
+```
+✗ Failed to delete container <VMID>: <error>
+```
+
+**Possible causes:**
+
+| Cause | Solution |
+|-------|----------|
+| Container still running | The script should auto-stop before deleting. If it failed to stop, stop it manually first: `pct stop <VMID>` |
+| Container is locked | Remove the lock: `pct unlock <VMID>`, then retry |
+| Permission denied | Ensure the API token has `VM.Allocate` permission for deletion |
+| Snapshots exist | Some storage backends require removing snapshots first. Delete snapshots via the Proxmox UI or `pct delsnapshot <VMID> <snapname>` |
+
+---
+
+### No containers found on this node
+
+```
+(no containers found on this node)
+```
+
+**Cause:** There are no LXC containers on the configured `PROXMOX_NODE`.
+
+**Solution:** Verify you're targeting the correct node in your `.env` file. Containers on other nodes won't appear.
 
 ---
 

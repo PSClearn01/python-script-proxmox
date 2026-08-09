@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Proxmox LXC Creator
+Proxmox LXC Manager
 ===================
-Interactive script to create new LXC containers on a Proxmox node (pmx-4)
-from available container templates.
+Interactive script to create and delete LXC containers on a Proxmox node
+(pmx-4) from available container templates.
 
 Authenticates via API token loaded from a .env file.
 
@@ -16,6 +16,7 @@ Usage:
 import os
 import sys
 import getpass
+import time
 import textwrap
 import mimetypes
 
@@ -559,8 +560,6 @@ def confirm_and_create(proxmox, node, template, storage, config):
 
 def wait_for_task(proxmox, node, task_id, timeout=120, interval=2):
     """Poll a Proxmox task until it completes or times out."""
-    import time
-
     elapsed = 0
     while elapsed < timeout:
         status = proxmox.nodes(node).tasks(task_id).status.get()
@@ -578,34 +577,214 @@ def wait_for_task(proxmox, node, task_id, timeout=120, interval=2):
 
 
 # ──────────────────────────────────────────────────────────────
-# Main
+# Container listing & deletion
 # ──────────────────────────────────────────────────────────────
 
-def main():
-    print("\n" + "═" * 50)
-    print("  Proxmox LXC Creator — Target node: pmx-4")
-    print("═" * 50)
+def list_containers(proxmox, node):
+    """
+    Return a list of all LXC containers on the given node.
 
-    # 1. Load config & connect
-    host, token_id, token_secret, node = load_config()
-    print(f"\n  ⟳ Connecting to Proxmox ({host}) …")
-    proxmox = connect(host, token_id, token_secret)
-    print(f"  ✓ Connected to node: {node}\n")
+    Each item is a dict with keys from the Proxmox API, including:
+    vmid, name, status, mem, maxmem, disk, maxdisk, cpus, etc.
+    """
+    try:
+        return proxmox.nodes(node).lxc.get()
+    except Exception as exc:
+        print(f"\n  ✗ Failed to list containers: {exc}\n")
+        return []
 
-    # 2. Pick a template (existing or upload a custom one)
+
+def pick_containers_to_delete(containers):
+    """
+    Display all LXC containers and let the user pick one or more to delete.
+
+    Returns a list of selected container dicts.
+    """
+    print("\n┌─────────────────────────────────────────────┐")
+    print("│         LXC Containers on This Node         │")
+    print("└─────────────────────────────────────────────┘")
+
+    if not containers:
+        print("\n  (no containers found on this node)\n")
+        return []
+
+    # Sort by VMID for consistent ordering
+    containers = sorted(containers, key=lambda c: int(c.get("vmid", 0)))
+
+    for idx, ct in enumerate(containers, start=1):
+        vmid = ct.get("vmid", "?")
+        name = ct.get("name", "(unnamed)")
+        status = ct.get("status", "unknown")
+        cpus = ct.get("cpus", "?")
+        mem_mb = int(ct.get("maxmem", 0)) / (1024 * 1024)
+        status_icon = "🟢" if status == "running" else "⚫"
+        print(f"  [{idx:>2}]  {status_icon}  CT {vmid} — {name}")
+        print(f"        status: {status}  |  cpus: {cpus}  |  "
+              f"memory: {mem_mb:.0f} MB")
+
+    print(f"\n  Enter container numbers to delete (comma-separated),")
+    print(f"  or 'all' to select all, or 'q' to cancel.")
+
+    while True:
+        choice = input("\n  Selection: ").strip().lower()
+
+        if choice in ("q", "quit", "cancel"):
+            return []
+
+        if choice == "all":
+            return list(containers)
+
+        # Parse comma-separated numbers
+        parts = [p.strip() for p in choice.split(",")]
+        selected = []
+        valid = True
+        for part in parts:
+            if not part.isdigit():
+                valid = False
+                break
+            idx = int(part)
+            if 1 <= idx <= len(containers):
+                selected.append(containers[idx - 1])
+            else:
+                valid = False
+                break
+
+        if valid and selected:
+            return selected
+
+        print("  ✗ Invalid selection, try again.")
+
+
+def delete_containers(proxmox, node):
+    """
+    Interactive flow to list, select, and delete LXC containers.
+
+    Running containers are stopped before deletion.
+    """
+    containers = list_containers(proxmox, node)
+    if not containers:
+        return
+
+    selected = pick_containers_to_delete(containers)
+    if not selected:
+        print("\n  ✗ No containers selected. Returning to menu.\n")
+        return
+
+    # Confirmation summary
+    print("\n┌─────────────────────────────────────────────┐")
+    print("│          Containers Marked for Deletion      │")
+    print("└─────────────────────────────────────────────┘")
+
+    for ct in selected:
+        vmid = ct.get("vmid", "?")
+        name = ct.get("name", "(unnamed)")
+        status = ct.get("status", "unknown")
+        print(f"  • CT {vmid} — {name}  ({status})")
+
+    running = [ct for ct in selected if ct.get("status") == "running"]
+    if running:
+        print(f"\n  ⚠  {len(running)} container(s) are currently running "
+              f"and will be stopped first.")
+
+    confirm = input("\n  ⚠  This action is IRREVERSIBLE. "
+                    "Proceed with deletion? (yes/no): ").strip().lower()
+    if confirm not in ("yes",):
+        print("\n  ✗ Aborted.\n")
+        return
+
+    # Process each container
+    for ct in selected:
+        vmid = ct.get("vmid")
+        name = ct.get("name", "(unnamed)")
+        status = ct.get("status", "unknown")
+
+        print(f"\n  ── CT {vmid} ({name}) ──")
+
+        # Stop the container if it's running
+        if status == "running":
+            print(f"  ⟳ Stopping container {vmid} …")
+            try:
+                task_id = proxmox.nodes(node).lxc(vmid).status.stop.post()
+                wait_for_task(proxmox, node, task_id)
+                print(f"  ✓ Container {vmid} stopped.")
+            except Exception as exc:
+                print(f"  ✗ Failed to stop container {vmid}: {exc}")
+                print(f"    Skipping deletion of {vmid}.")
+                continue
+
+        # Delete the container
+        print(f"  ⟳ Deleting container {vmid} …")
+        try:
+            task_id = proxmox.nodes(node).lxc(vmid).delete()
+            wait_for_task(proxmox, node, task_id)
+            print(f"  ✓ Container {vmid} deleted successfully!")
+        except Exception as exc:
+            print(f"  ✗ Failed to delete container {vmid}: {exc}")
+
+    print()
+
+
+# ──────────────────────────────────────────────────────────────
+# Main menu & entry point
+# ──────────────────────────────────────────────────────────────
+
+def main_menu():
+    """Display the main menu and return the user's choice."""
+    print("┌─────────────────────────────────────────────┐")
+    print("│               Main Menu                     │")
+    print("└─────────────────────────────────────────────┘")
+    print("  [1]  Create a new LXC container")
+    print("  [2]  Delete existing LXC container(s)")
+    print("  [3]  Exit")
+
+    while True:
+        choice = input("\n  Select an option: ").strip()
+        if choice in ("1", "2", "3"):
+            return choice
+        print("  ✗ Invalid selection, try again.")
+
+
+def create_flow(proxmox, node, host, token_id, token_secret):
+    """Run the interactive container-creation workflow."""
+    # Pick a template (existing or upload a custom one)
     templates = list_templates(proxmox, node)
     template = pick_template(
         proxmox, node, host, token_id, token_secret, templates
     )
 
-    # 3. Pick storage
+    # Pick storage
     storage = pick_storage(proxmox, node)
 
-    # 4. Configure the new container
+    # Configure the new container
     config = configure_container(proxmox, node)
 
-    # 5. Confirm and create
+    # Confirm and create
     confirm_and_create(proxmox, node, template, storage, config)
+
+
+def main():
+    print("\n" + "═" * 50)
+    print("  Proxmox LXC Manager — Target node: pmx-4")
+    print("═" * 50)
+
+    # Load config & connect
+    host, token_id, token_secret, node = load_config()
+    print(f"\n  ⟳ Connecting to Proxmox ({host}) …")
+    proxmox = connect(host, token_id, token_secret)
+    print(f"  ✓ Connected to node: {node}\n")
+
+    while True:
+        choice = main_menu()
+
+        if choice == "1":
+            create_flow(proxmox, node, host, token_id, token_secret)
+        elif choice == "2":
+            delete_containers(proxmox, node)
+        elif choice == "3":
+            print("\n  Goodbye!\n")
+            break
+
+        print()  # breathing room between menu cycles
 
 
 if __name__ == "__main__":
