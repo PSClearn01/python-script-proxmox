@@ -1,6 +1,6 @@
 # Usage Guide
 
-This guide walks through a complete run of the Proxmox VM & LXC manager script, covering LXC container creation, cloning, deletion, and QEMU virtual machine creation and deletion.
+This guide walks through a complete run of the Proxmox VM & LXC manager script, covering LXC container creation, cloning, deletion, QEMU virtual machine creation, VM template cloning, and VM deletion.
 
 ---
 
@@ -23,9 +23,10 @@ After connecting to Proxmox, the script presents a **main menu**:
 ├─────────────────────────────────────────────┤
 │  Virtual Machines                           │
 │  [4]  Create VM from ISO                    │
-│  [5]  Delete VM(s)                          │
+│  [5]  Clone VM from template                │
+│  [6]  Delete VM(s)                          │
 ├─────────────────────────────────────────────┤
-│  [6]  Exit                                  │
+│  [7]  Exit                                  │
 └─────────────────────────────────────────────┘
 
   Select an option:
@@ -627,9 +628,114 @@ A full summary is displayed before creating the VM via the QEMU API:
 
 ---
 
+## Clone VM from Template
+
+Select option **[5]** from the main menu to clone a new VM from an existing VM template.
+
+### Step 1 — Select a VM Template
+
+The script lists all QEMU VMs that have been converted to templates on the node:
+
+```
+┌─────────────────────────────────────────────┐
+│       VM Templates Available to Clone       │
+└─────────────────────────────────────────────┘
+  [ 1]  📋  VM 9000 — ubuntu-22.04-template
+        cpus: 2  |  memory: 2048 MB  |  disk: 32.0 GB
+  [ 2]  📋  VM 9001 — debian-12-template
+        cpus: 1  |  memory: 1024 MB  |  disk: 16.0 GB
+
+  Select a VM template to clone (or 'q' to cancel): 1
+
+  ✓ Clone source: VM 9000 — ubuntu-22.04-template
+```
+
+> **Tip:** To create a VM template, first set up a VM with your desired configuration and OS, then right-click it in the Proxmox UI and select **Convert to Template**.
+
+### Step 2 — Configure Clone Settings
+
+Configure the clone parameters. Defaults are shown in brackets — press Enter to accept them:
+
+```
+┌─────────────────────────────────────────────┐
+│        VM Clone Configuration               │
+└─────────────────────────────────────────────┘
+
+  Source template: VM 9000 — ubuntu-22.04-template
+
+  New VM ID (VMID) [200]:
+  New VM name [ubuntu-22.04-template-clone]: ubuntu-clone-01
+
+  ── Clone Type ──
+  Full clone:   Independent copy (uses more disk space, slower)
+  Linked clone: Shares base image with template (faster, less disk)
+                Note: Template cannot be deleted while linked
+                clones exist.
+
+  Clone type (full/linked) [full]:
+
+  ── Target Storage for Clone ──
+  Use a different storage for the clone? (y/n) [n]:
+
+  ── Disk Format ──
+  [1]  qcow2 (QEMU copy-on-write, supports snapshots)
+  [2]  raw   (raw disk image, best performance)
+  [3]  vmdk  (VMware compatible)
+  [4]  (same as source)
+
+  Disk format [4]: 1
+
+  Description (optional) [Clone of VM 9000 (ubuntu-22.04-template)]:
+  Start VM after cloning? (y/n) [n]: y
+```
+
+#### Clone Configuration Options Reference (VM)
+
+| Setting                  | Default                      | Description                                                  |
+|--------------------------|------------------------------|--------------------------------------------------------------|
+| **New VM ID (VMID)**     | Auto                         | Unique numeric ID for the cloned VM                          |
+| **New VM name**          | `<source_name>-clone`        | Name assigned to the clone                                   |
+| **Clone type**           | `full`                       | `full` (independent copy) or `linked` (shares base image)    |
+| **Target storage**       | Source storage               | Target storage pool (optional, for full clones only)         |
+| **Disk format**          | Same as source               | `qcow2`, `raw`, or `vmdk` (full clones only)                 |
+| **Description**          | `Clone of VM <vmid> (<name>)` | Optional description/notes for the cloned VM                |
+| **Start after cloning**  | `no`                         | Whether to start the VM immediately after cloning            |
+
+### Step 3 — Review and Execute Clone
+
+A summary is displayed before executing the clone operation:
+
+```
+┌─────────────────────────────────────────────┐
+│           VM Clone Summary                   │
+└─────────────────────────────────────────────┘
+
+  Source:         VM 9000 — ubuntu-22.04-template
+  New VMID:       200
+  New name:       ubuntu-clone-01
+  Clone type:     Full
+  Target storage: (same as source)
+  Disk format:    qcow2
+  Description:    Clone of VM 9000 (ubuntu-22.04-template)
+  Start after:    Yes
+  Node:           pmx-4
+
+  Proceed with VM clone? (y/n): y
+
+  ⟳ Cloning virtual machine …
+  ✓ Task started: UPID:pmx-4:00003C4D:...
+  ⟳ Waiting for clone to complete …
+  ✓ VM 200 cloned successfully!
+
+  ⟳ Starting cloned virtual machine …
+  ✓ VM 200 is now running.
+```
+
+---
+
 ## Delete VMs
 
-Select option **[5]** from the main menu to enter the QEMU VM deletion workflow.
+Select option **[6]** from the main menu to enter the QEMU VM deletion workflow.
 
 ### Step 1 — VM List
 
@@ -704,6 +810,7 @@ python create_lxc.py
 # → Select [2] to clone an existing LXC container
 # → Select [3] to delete LXC container(s)
 # → Select [4] to create a QEMU VM from an ISO
-# → Select [5] to delete VM(s)
-# → Select [6] to exit
+# → Select [5] to clone a VM from a VM template
+# → Select [6] to delete VM(s)
+# → Select [7] to exit
 ```

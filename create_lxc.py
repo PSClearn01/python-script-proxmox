@@ -9,6 +9,7 @@ Features:
   • Create LXC containers from templates (with optional template upload)
   • Clone existing LXC containers (full or linked clones)
   • Create QEMU VMs from ISO images (with optional ISO upload)
+  • Clone QEMU VMs from VM templates (full or linked clones)
   • Delete LXC containers and QEMU VMs
 
 Authenticates via API token loaded from a .env file.
@@ -1243,6 +1244,221 @@ def confirm_and_create_vm(proxmox, node, iso, storage, config):
 
 
 # ──────────────────────────────────────────────────────────────
+# VM cloning (from VM template)
+# ──────────────────────────────────────────────────────────────
+
+def list_vm_templates(proxmox, node):
+    """
+    Return a list of QEMU VMs that are marked as templates on the given node.
+
+    Each item is a dict with keys from the Proxmox API, including:
+    vmid, name, status, maxmem, maxdisk, cpus, etc.
+    """
+    vms = list_vms(proxmox, node)
+    templates = []
+    for vm in vms:
+        if vm.get("template"):
+            templates.append(vm)
+    return sorted(templates, key=lambda v: int(v.get("vmid", 0)))
+
+
+def pick_vm_template(proxmox, node):
+    """
+    Display all QEMU VM templates and let the user pick one to clone.
+
+    Returns the selected VM template dict, or None if cancelled.
+    """
+    templates = list_vm_templates(proxmox, node)
+
+    print("\n┌─────────────────────────────────────────────┐")
+    print("│       VM Templates Available to Clone       │")
+    print("└─────────────────────────────────────────────┘")
+
+    if not templates:
+        print("\n  (no VM templates found on this node)")
+        print("  Tip: Convert a VM to a template in the Proxmox UI")
+        print("       (right-click → Convert to Template).\n")
+        return None
+
+    for idx, vm in enumerate(templates, start=1):
+        vmid = vm.get("vmid", "?")
+        name = vm.get("name", "(unnamed)")
+        cpus = vm.get("cpus", "?")
+        mem_mb = int(vm.get("maxmem", 0)) / (1024 * 1024)
+        disk_gb = int(vm.get("maxdisk", 0)) / (1024 ** 3)
+        print(f"  [{idx:>2}]  📋  VM {vmid} — {name}")
+        print(f"        cpus: {cpus}  |  memory: {mem_mb:.0f} MB  |  "
+              f"disk: {disk_gb:.1f} GB")
+
+    while True:
+        choice = input(
+            "\n  Select a VM template to clone (or 'q' to cancel): "
+        ).strip()
+        if choice.lower() in ("q", "quit", "cancel"):
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= len(templates):
+            selected = templates[int(choice) - 1]
+            vmid = selected.get("vmid", "?")
+            name = selected.get("name", "(unnamed)")
+            print(f"\n  ✓ Clone source: VM {vmid} — {name}\n")
+            return selected
+        print("  ✗ Invalid selection, try again.")
+
+
+def configure_vm_clone(proxmox, node, source):
+    """
+    Interactively collect settings for cloning a VM from a template.
+
+    Args:
+        proxmox: ProxmoxAPI handle.
+        node: Proxmox node name.
+        source: Source VM template dict (must have 'vmid' and 'name').
+
+    Returns a config dict for the clone operation.
+    """
+    suggested_id = next_vmid(proxmox)
+    source_vmid = source.get("vmid", "?")
+    source_name = source.get("name", "(unnamed)")
+
+    print("┌─────────────────────────────────────────────┐")
+    print("│        VM Clone Configuration               │")
+    print("└─────────────────────────────────────────────┘")
+    print(f"\n  Source template: VM {source_vmid} — {source_name}\n")
+
+    new_vmid = prompt_value("New VM ID (VMID)", default=suggested_id, cast=int)
+    name = prompt_value("New VM name", default=f"{source_name}-clone")
+
+    # Full or linked clone
+    print("\n  ── Clone Type ──")
+    print("  Full clone:   Independent copy (uses more disk space, slower)")
+    print("  Linked clone: Shares base image with template (faster, less disk)")
+    print("                Note: Template cannot be deleted while linked")
+    print("                clones exist.\n")
+    clone_type = prompt_value("Clone type (full/linked)", default="full")
+    full_clone = 1 if clone_type.lower() in ("full", "f") else 0
+
+    # Target storage (only relevant for full clones)
+    target_storage = None
+    if full_clone:
+        print("\n  ── Target Storage for Clone ──")
+        use_custom = prompt_value(
+            "Use a different storage for the clone? (y/n)", default="n"
+        )
+        if use_custom.lower() in ("y", "yes"):
+            target_storage = pick_storage(
+                proxmox, node, content_filter="images"
+            )
+
+    # Format (disk format for full clones)
+    disk_format = None
+    if full_clone:
+        print("\n  ── Disk Format ──")
+        print("  [1]  qcow2 (QEMU copy-on-write, supports snapshots)")
+        print("  [2]  raw   (raw disk image, best performance)")
+        print("  [3]  vmdk  (VMware compatible)")
+        print("  [4]  (same as source)\n")
+        fmt_choice = prompt_value("Disk format", default="4")
+        format_map = {"1": "qcow2", "2": "raw", "3": "vmdk"}
+        disk_format = format_map.get(fmt_choice)
+
+    # Description
+    description = prompt_value(
+        "Description (optional)",
+        default=f"Clone of VM {source_vmid} ({source_name})"
+    )
+
+    # Start after clone?
+    start_input = prompt_value(
+        "Start VM after cloning? (y/n)", default="n"
+    )
+    start_after = start_input.lower() in ("y", "yes")
+
+    config = {
+        "new_vmid": new_vmid,
+        "name": name,
+        "full_clone": full_clone,
+        "target_storage": target_storage,
+        "disk_format": disk_format,
+        "description": description,
+        "start_after": start_after,
+    }
+    return config
+
+
+def confirm_and_clone_vm(proxmox, node, source, config):
+    """Show a summary and execute the VM template clone upon confirmation."""
+    source_vmid = source.get("vmid", "?")
+    source_name = source.get("name", "(unnamed)")
+
+    clone_type_label = "Full" if config["full_clone"] else "Linked"
+    storage_label = config["target_storage"] or "(same as source)"
+    format_label = config["disk_format"] or "(same as source)"
+
+    summary = textwrap.dedent(f"""
+    ┌─────────────────────────────────────────────┐
+    │           VM Clone Summary                   │
+    └─────────────────────────────────────────────┘
+
+      Source:         VM {source_vmid} — {source_name}
+      New VMID:       {config['new_vmid']}
+      New name:       {config['name']}
+      Clone type:     {clone_type_label}
+      Target storage: {storage_label}
+      Disk format:    {format_label}
+      Description:    {config['description']}
+      Start after:    {'Yes' if config['start_after'] else 'No'}
+      Node:           {node}
+    """)
+    print(summary)
+
+    confirm = input("  Proceed with VM clone? (y/n): ").strip().lower()
+    if confirm not in ("y", "yes"):
+        print("\n  ✗ Aborted.\n")
+        return
+
+    # Build the API payload
+    payload = {
+        "newid": config["new_vmid"],
+        "name": config["name"],
+        "full": config["full_clone"],
+        "description": config["description"],
+    }
+    if config["target_storage"]:
+        payload["storage"] = config["target_storage"]
+    if config["disk_format"]:
+        payload["format"] = config["disk_format"]
+
+    print("\n  ⟳ Cloning virtual machine …")
+
+    try:
+        task_id = proxmox.nodes(node).qemu(source_vmid).clone.post(**payload)
+        print(f"  ✓ Task started: {task_id}")
+    except Exception as exc:
+        print(f"\n  ✗ Failed to clone VM: {exc}\n")
+        return
+
+    # Wait for the task to finish
+    print("  ⟳ Waiting for clone to complete …")
+    try:
+        wait_for_task(proxmox, node, task_id, timeout=600)
+    except Exception as exc:
+        print(f"\n  ⚠ Could not verify task completion: {exc}")
+        print("    Check the Proxmox UI for task status.\n")
+        return
+
+    print(f"  ✓ VM {config['new_vmid']} cloned successfully!\n")
+
+    # Optionally start the cloned VM
+    if config["start_after"]:
+        print("  ⟳ Starting cloned virtual machine …")
+        try:
+            proxmox.nodes(node).qemu(config["new_vmid"]).status.start.post()
+            print(f"  ✓ VM {config['new_vmid']} is now running.\n")
+        except Exception as exc:
+            print(f"  ⚠ Failed to start VM: {exc}\n")
+
+
+# ──────────────────────────────────────────────────────────────
 # Container listing & deletion
 # ──────────────────────────────────────────────────────────────
 
@@ -1582,6 +1798,22 @@ def create_vm_flow(proxmox, node, host, token_id, token_secret):
     confirm_and_create_vm(proxmox, node, iso, storage, config)
 
 
+def clone_vm_flow(proxmox, node):
+    """Run the interactive VM-from-template clone workflow."""
+    # Pick a VM template
+    source = pick_vm_template(proxmox, node)
+    if source is None:
+        print("  ✗ No VM template selected. Returning to menu.\n")
+        return
+
+    # Configure the clone
+    config = configure_vm_clone(proxmox, node, source)
+
+    # Confirm and clone
+    confirm_and_clone_vm(proxmox, node, source, config)
+
+
+
 # ──────────────────────────────────────────────────────────────
 # Main menu & entry point
 # ──────────────────────────────────────────────────────────────
@@ -1598,14 +1830,15 @@ def main_menu():
     print("├─────────────────────────────────────────────┤")
     print("│  Virtual Machines                           │")
     print("│  [4]  Create VM from ISO                    │")
-    print("│  [5]  Delete VM(s)                          │")
+    print("│  [5]  Clone VM from template                │")
+    print("│  [6]  Delete VM(s)                          │")
     print("├─────────────────────────────────────────────┤")
-    print("│  [6]  Exit                                  │")
+    print("│  [7]  Exit                                  │")
     print("└─────────────────────────────────────────────┘")
 
     while True:
         choice = input("\n  Select an option: ").strip()
-        if choice in ("1", "2", "3", "4", "5", "6"):
+        if choice in ("1", "2", "3", "4", "5", "6", "7"):
             return choice
         print("  ✗ Invalid selection, try again.")
 
@@ -1633,8 +1866,10 @@ def main():
         elif choice == "4":
             create_vm_flow(proxmox, node, host, token_id, token_secret)
         elif choice == "5":
-            delete_vms(proxmox, node)
+            clone_vm_flow(proxmox, node)
         elif choice == "6":
+            delete_vms(proxmox, node)
+        elif choice == "7":
             print("\n  Goodbye!\n")
             break
 

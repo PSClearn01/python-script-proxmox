@@ -1,6 +1,6 @@
 # Troubleshooting
 
-Common issues and their solutions when using the Proxmox LXC Manager script.
+Common issues and their solutions when using the Proxmox VM & LXC Manager script.
 
 ---
 
@@ -251,6 +251,73 @@ pip install --upgrade proxmoxer requests
 ```
 
 The script has been tested with `proxmoxer >= 2.0`.
+
+---
+
+## VM Cloning Issues
+
+### No VM templates found
+
+```
+(no VM templates found on this node)
+```
+
+**Cause:** No QEMU VMs have been converted to templates on the configured `PROXMOX_NODE`.
+
+**Solution:**
+1. Create and configure a VM with your desired OS and settings
+2. Right-click the VM in the Proxmox UI → **Convert to Template**
+3. The VM will now appear in the template list when using option `[5]`
+
+---
+
+### ✗ Failed to clone VM: 403 Forbidden
+
+**Cause:** Insufficient API token permissions.
+
+**Solution:** The token needs these permissions:
+
+| Permission | Required for |
+|-----------|-------------|
+| `VM.Clone` | Cloning the VM template |
+| `VM.Allocate` | Creating a new VM from the clone |
+| `Datastore.AllocateSpace` | Allocating disk space (also needed on target storage if different) |
+
+See [API Token Setup](api-token-setup.md#required-permissions) for details.
+
+---
+
+### Linked clone fails
+
+**Cause:** The source template's storage backend doesn't support the snapshot mechanism required for linked clones.
+
+**Solution:** Use a full clone instead, or ensure the template is stored on a backend that supports snapshots:
+- ZFS
+- LVM-thin
+- Ceph (RBD)
+- qcow2 on directory/NFS storage
+
+---
+
+### Clone takes a very long time or times out
+
+```
+⚠ Could not verify task completion: Task UPID:... did not complete within 600s
+```
+
+**Cause:** Full clones copy the entire disk image, which can take significant time for large VMs.
+
+**Solution:** The clone task is likely still running on the Proxmox server — the timeout only affects the script's polling, not the server-side task. Check progress in the Proxmox UI (Node → Tasks). If speed is important, consider using linked clones instead.
+
+---
+
+### Template cannot be deleted
+
+**Cause:** Linked clones depend on the template's base image. Proxmox prevents deletion of templates that have active linked clones.
+
+**Solution:** Either:
+- Delete all linked clones first, then delete the template
+- Use full clones instead, which are independent of the template
 
 ---
 

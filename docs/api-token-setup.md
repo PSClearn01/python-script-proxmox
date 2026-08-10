@@ -96,6 +96,7 @@ If using privilege separation (or a non-root user), the token needs the followin
 | `VM.Config.Network`    | `/vms`                   | Configure networking              |
 | `VM.Config.Options`    | `/vms`                   | Set general options (onboot etc.) |
 | `VM.PowerMgmt`         | `/vms`                   | Start/stop containers             |
+| `VM.Clone`             | `/vms`                   | Clone containers and VMs          |
 | `Datastore.AllocateSpace` | `/storage/<name>`     | Allocate disk on storage          |
 | `Datastore.Audit`      | `/storage`               | List storage and templates        |
 | `Sys.Audit`            | `/nodes/<node>`          | Query node and task status        |
