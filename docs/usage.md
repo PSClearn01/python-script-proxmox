@@ -125,9 +125,15 @@ The script lists storage pools available for container root filesystems (those a
 
 ## Stage 4 — Container Configuration
 
-You'll be prompted for each setting. Defaults are shown in brackets — press Enter to accept them.
+At the start of the creation workflow, you will first be asked how many containers you want to create (default `1`). If creating multiple containers, you will be prompted for each container's settings sequentially:
 
 ```
+┌─────────────────────────────────────────────┐
+│         Create LXC Container(s)             │
+└─────────────────────────────────────────────┘
+
+  Number of LXC containers to create [1]: 2
+
 ┌─────────────────────────────────────────────┐
 │         New Container Configuration         │
 └─────────────────────────────────────────────┘
@@ -150,13 +156,18 @@ You'll be prompted for each setting. Defaults are shown in brackets — press En
   Start on boot? (y/n) [y]: 
   Start container after creation? (y/n) [y]: 
   Unprivileged container? (y/n) [y]: 
+
+── Container 2 of 2 Configuration ──
+  Container ID (VMID) [106]: 
+  Hostname: web-server-02
+  ...
 ```
 
 ### Configuration Options Reference
 
 | Setting                  | Default   | Description                                              |
 |--------------------------|-----------|----------------------------------------------------------|
-| **Container ID (VMID)**  | Auto      | Unique numeric ID; auto-suggested as the next available  |
+| **Container ID (VMID)**  | Auto      | Unique numeric ID; auto-suggested as the next available (auto-incremented during batch runs) |
 | **Hostname**             | —         | Required. DNS-friendly name for the container            |
 | **Root password**        | —         | Required. Hidden input. Sets the root user password      |
 | **CPU cores**            | `1`       | Number of CPU cores allocated                            |
@@ -174,11 +185,11 @@ You'll be prompted for each setting. Defaults are shown in brackets — press En
 
 ## Stage 5 — Review and Create
 
-A full summary is displayed before anything is created:
+A full summary is displayed before anything is created (showing all instances if creating in batch mode):
 
 ```
 ┌─────────────────────────────────────────────┐
-│             Container Summary                │
+│  Container Summary (1 container)            │
 └─────────────────────────────────────────────┘
 
   VMID:           105
@@ -196,18 +207,68 @@ A full summary is displayed before anything is created:
   Start after:    Yes
   Node:           pmx-4
 
-  Proceed with creation? (y/n): y
+  Proceed with creation of 1 container(s)? (y/n): y
 
-  ⟳ Creating container …
+  ⟳ Creating container 105 …
   ✓ Task started: UPID:pmx-4:00001A2B:...
   ⟳ Waiting for task to complete …
   ✓ Container 105 created successfully!
 
-  ⟳ Starting container …
+  ⟳ Starting container 105 …
   ✓ Container 105 is now running.
 ```
 
 Answering `n` aborts without making any changes.
+
+---
+
+## Batch Creation & Cloning (Multiple VMs / LXCs)
+
+All creation and cloning workflows (**[1] Create LXC**, **[2] Clone LXC**, **[4] Create VM**, **[5] Clone VM**) support provisioning multiple instances in a single batch operation.
+
+### How Batch Mode Works
+
+1. **Quantity Prompt**: When starting a creation or cloning flow, the script prompts for the number of instances to create:
+   ```
+   Number of LXC containers to create [1]: 3
+   ```
+2. **Sequential Configuration**: The script loops to prompt for settings for each individual instance (`── Container 1 of 3 Configuration ──`, `── Container 2 of 3 Configuration ──`, etc.).
+3. **Automatic Unique VMIDs**: As you configure each instance, the script tracks assigned VMIDs in memory (`used_vmids`), ensuring that the auto-suggested VMID for subsequent instances is incremented and non-conflicting.
+4. **Unified Review Summary**: Before any API calls are made, a combined summary of all configured instances is presented:
+   ```
+   ┌─────────────────────────────────────────────┐
+   │  Container Summary (3 containers)            │
+   └─────────────────────────────────────────────┘
+
+     ── Container #1 ──
+     VMID:           105
+     Hostname:       web-01
+     ...
+
+     ── Container #2 ──
+     VMID:           106
+     Hostname:       web-02
+     ...
+
+     ── Container #3 ──
+     VMID:           107
+     Hostname:       web-03
+     ...
+
+     Proceed with creation of 3 container(s)? (y/n): y
+   ```
+5. **Sequential Batch Execution**: Upon confirmation, each instance is created or cloned sequentially with task progress monitoring:
+   ```
+     ━━ Creating container 1/3: web-01 (VMID 105) ━━
+     ⟳ Creating container 105 …
+     ✓ Task started: UPID:pmx-4:00001A2B:...
+     ⟳ Waiting for task to complete …
+     ✓ Container 105 created successfully!
+
+     ━━ Creating container 2/3: web-02 (VMID 106) ━━
+     ...
+   ```
+6. **Fault Tolerance**: If creation of one instance in a batch fails, the script outputs the error message and continues deploying the remaining instances.
 
 ---
 

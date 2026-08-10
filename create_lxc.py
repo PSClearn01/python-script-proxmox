@@ -6,11 +6,11 @@ Interactive script to manage LXC containers and QEMU virtual machines
 on a Proxmox node.
 
 Features:
-  • Create LXC containers from templates (with optional template upload)
-  • Clone existing LXC containers (full or linked clones)
-  • Create QEMU VMs from ISO images (with optional ISO upload)
-  • Clone QEMU VMs from VM templates (full or linked clones)
-  • Delete LXC containers and QEMU VMs
+  • Create LXC containers from templates in single or batch mode (with optional template upload)
+  • Clone existing LXC containers in single or batch mode (full or linked clones)
+  • Create QEMU VMs from ISO images in single or batch mode (with optional ISO upload)
+  • Clone QEMU VMs from VM templates in single or batch mode (full or linked clones)
+  • Delete LXC containers and QEMU VMs (individual or multi-select)
 
 Authenticates via API token loaded from a .env file.
 

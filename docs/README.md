@@ -18,6 +18,7 @@ An interactive Python script that creates, clones, and deletes LXC containers an
 
 ## Features
 
+- **Batch VM & LXC creation** — provision or clone multiple LXC containers or QEMU VMs in a single workflow run, with individual instance configuration prompts and automatic sequential VMID tracking
 - **LXC template discovery & upload** — automatically scans storage pools for available LXC templates (`vztmpl`) with support for uploading local template files (`.tar.gz`, `.tar.xz`, `.tar.zst`)
 - **LXC container cloning** — clone existing LXC containers with support for full (independent copy) or linked (shared base) clones, custom hostnames, target storage selection, and descriptions
 - **VM creation from ISO** — create QEMU virtual machines from ISO images stored on Proxmox storage pools
@@ -33,7 +34,7 @@ An interactive Python script that creates, clones, and deletes LXC containers an
 - **Auto-start** — optionally start containers or VMs immediately after creation or cloning
 - **Container & VM deletion** — list LXC containers and QEMU VMs with multi-select deletion (individual numbers, `all`, or `q` to cancel)
 - **Safe deletion workflow** — automatically stops running containers and VMs before deletion, guarded by a mandatory `yes` confirmation prompt
-- **Expanded main menu** — interactive main menu with 7 structured options to manage containers and VMs in a single session without restarting the script:
+- **Expanded main menu** — interactive main menu with 7 structured options to manage single or batch containers and VMs in a single session without restarting the script:
   1. **Create LXC from template**
   2. **Clone an existing LXC container**
   3. **Delete LXC container(s)**
@@ -42,7 +43,7 @@ An interactive Python script that creates, clones, and deletes LXC containers an
   6. **Delete VM(s)**
   7. **Exit**
 - **Secure credentials** — API token and host stored in a `.env` file, kept out of version control
-- **Smart defaults** — auto-suggests next available VMID and sensible resource defaults
+- **Smart defaults** — auto-suggests next available VMID (preventing batch conflicts) and sensible resource defaults
 
 ---
 
