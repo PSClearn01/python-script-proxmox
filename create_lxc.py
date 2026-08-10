@@ -116,12 +116,17 @@ def wait_for_task(proxmox, node, task_id, timeout=120, interval=2):
     raise TimeoutError(f"Task {task_id} did not complete within {timeout}s")
 
 
-def next_vmid(proxmox):
-    """Ask the cluster for the next available VMID."""
+def next_vmid(proxmox, used_vmids=None):
+    """Ask the cluster for the next available VMID, skipping any in used_vmids."""
+    if used_vmids is None:
+        used_vmids = set()
     try:
-        return proxmox.cluster.nextid.get()
+        vmid = int(proxmox.cluster.nextid.get())
     except Exception:
-        return 100  # fallback
+        vmid = 100
+    while vmid in used_vmids:
+        vmid += 1
+    return vmid
 
 
 def prompt_value(label, default=None, required=False, cast=None):
@@ -674,9 +679,9 @@ def pick_storage(proxmox, node, content_filter=None):
 # LXC container creation (from template)
 # ──────────────────────────────────────────────────────────────
 
-def configure_container(proxmox, node):
-    """Interactively collect all settings for the new container."""
-    suggested_id = next_vmid(proxmox)
+def configure_container(proxmox, node, used_vmids=None):
+    """Interactively collect all settings for a new container."""
+    suggested_id = next_vmid(proxmox, used_vmids)
 
     print("┌─────────────────────────────────────────────┐")
     print("│         New Container Configuration         │")
@@ -747,86 +752,86 @@ def configure_container(proxmox, node):
     return config
 
 
-def confirm_and_create(proxmox, node, template, storage, config):
-    """Show a summary and create the container upon confirmation."""
+def confirm_and_create(proxmox, node, template, storage, configs):
+    """Show a summary and create container(s) upon confirmation."""
+    if not isinstance(configs, list):
+        configs = [configs]
 
-    summary = textwrap.dedent(f"""
-    ┌─────────────────────────────────────────────┐
-    │             Container Summary                │
-    └─────────────────────────────────────────────┘
+    count = len(configs)
+    header = f"Container Summary ({count} container{'s' if count > 1 else ''})"
+    print(f"\n┌─────────────────────────────────────────────┐")
+    print(f"│  {header:<43}│")
+    print(f"└─────────────────────────────────────────────┘")
 
-      VMID:           {config['vmid']}
-      Hostname:       {config['hostname']}
-      Template:       {template['filename']}
-      Storage:        {storage}
-      CPU cores:      {config['cores']}
-      Memory:         {config['memory']} MB
-      Swap:           {config['swap']} MB
-      Root disk:      {config['disk_size']} GB
-      Network:        {config['net0']}
-      IP config:      {config['ip_config']}
-      On boot:        {'Yes' if config['onboot'] else 'No'}
-      Unprivileged:   {'Yes' if config['unprivileged'] else 'No'}
-      Start after:    {'Yes' if config['start_after'] else 'No'}
-      Node:           {node}
-    """)
-    print(summary)
+    for idx, config in enumerate(configs, start=1):
+        if count > 1:
+            print(f"\n  ── Container #{idx} ──")
+        print(f"  VMID:           {config['vmid']}")
+        print(f"  Hostname:       {config['hostname']}")
+        print(f"  Template:       {template['filename']}")
+        print(f"  Storage:        {storage}")
+        print(f"  CPU cores:      {config['cores']}")
+        print(f"  Memory:         {config['memory']} MB")
+        print(f"  Swap:           {config['swap']} MB")
+        print(f"  Root disk:      {config['disk_size']} GB")
+        print(f"  Network:        {config['net0']}")
+        print(f"  IP config:      {config['ip_config']}")
+        print(f"  On boot:        {'Yes' if config['onboot'] else 'No'}")
+        print(f"  Unprivileged:   {'Yes' if config['unprivileged'] else 'No'}")
+        print(f"  Start after:    {'Yes' if config['start_after'] else 'No'}")
+        print(f"  Node:           {node}")
 
-    confirm = input("  Proceed with creation? (y/n): ").strip().lower()
+    confirm = input(f"\n  Proceed with creation of {count} container(s)? (y/n): ").strip().lower()
     if confirm not in ("y", "yes"):
         print("\n  ✗ Aborted.\n")
-        sys.exit(0)
-
-    # Build the API payload
-    payload = {
-        "vmid": config["vmid"],
-        "ostemplate": template["volid"],
-        "hostname": config["hostname"],
-        "password": config["password"],
-        "storage": storage,
-        "rootfs": f"{storage}:{config['disk_size']}",
-        "cores": config["cores"],
-        "memory": config["memory"],
-        "swap": config["swap"],
-        "net0": config["net0"],
-        "nameserver": "",
-        "onboot": config["onboot"],
-        "unprivileged": config["unprivileged"],
-    }
-
-    # Attach IP config (ipconfig is a separate param in newer PVE)
-    # For net0, Proxmox expects: name=eth0,bridge=vmbr0,ip=dhcp
-    # We append the ip portion to net0
-    payload["net0"] = f"{config['net0']},{config['ip_config']}"
-
-    print("\n  ⟳ Creating container …")
-
-    try:
-        task_id = proxmox.nodes(node).lxc.create(**payload)
-        print(f"  ✓ Task started: {task_id}")
-    except Exception as exc:
-        print(f"\n  ✗ Failed to create container: {exc}\n")
-        sys.exit(1)
-
-    # Wait for the task to finish
-    print("  ⟳ Waiting for task to complete …")
-    try:
-        wait_for_task(proxmox, node, task_id)
-    except Exception as exc:
-        print(f"\n  ⚠ Could not verify task completion: {exc}")
-        print("    Check the Proxmox UI for task status.\n")
         return
 
-    print(f"  ✓ Container {config['vmid']} created successfully!\n")
+    for idx, config in enumerate(configs, start=1):
+        if count > 1:
+            print(f"\n  ━━ Creating container {idx}/{count}: {config['hostname']} (VMID {config['vmid']}) ━━")
 
-    # Optionally start the container
-    if config["start_after"]:
-        print("  ⟳ Starting container …")
+        payload = {
+            "vmid": config["vmid"],
+            "ostemplate": template["volid"],
+            "hostname": config["hostname"],
+            "password": config["password"],
+            "storage": storage,
+            "rootfs": f"{storage}:{config['disk_size']}",
+            "cores": config["cores"],
+            "memory": config["memory"],
+            "swap": config["swap"],
+            "net0": f"{config['net0']},{config['ip_config']}",
+            "nameserver": "",
+            "onboot": config["onboot"],
+            "unprivileged": config["unprivileged"],
+        }
+
+        print(f"\n  ⟳ Creating container {config['vmid']} …")
+
         try:
-            proxmox.nodes(node).lxc(config["vmid"]).status.start.post()
-            print(f"  ✓ Container {config['vmid']} is now running.\n")
+            task_id = proxmox.nodes(node).lxc.create(**payload)
+            print(f"  ✓ Task started: {task_id}")
         except Exception as exc:
-            print(f"  ⚠ Failed to start container: {exc}\n")
+            print(f"\n  ✗ Failed to create container {config['vmid']}: {exc}\n")
+            continue
+
+        print("  ⟳ Waiting for task to complete …")
+        try:
+            wait_for_task(proxmox, node, task_id)
+        except Exception as exc:
+            print(f"\n  ⚠ Could not verify task completion for CT {config['vmid']}: {exc}")
+            print("    Check the Proxmox UI for task status.\n")
+            continue
+
+        print(f"  ✓ Container {config['vmid']} created successfully!\n")
+
+        if config["start_after"]:
+            print(f"  ⟳ Starting container {config['vmid']} …")
+            try:
+                proxmox.nodes(node).lxc(config["vmid"]).status.start.post()
+                print(f"  ✓ Container {config['vmid']} is now running.\n")
+            except Exception as exc:
+                print(f"  ⚠ Failed to start container {config['vmid']}: {exc}\n")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -890,7 +895,7 @@ def pick_clone_source(proxmox, node):
         print("  ✗ Invalid selection, try again.")
 
 
-def configure_clone(proxmox, node, source):
+def configure_clone(proxmox, node, source, used_vmids=None):
     """
     Interactively collect settings for cloning an LXC container.
 
@@ -898,10 +903,11 @@ def configure_clone(proxmox, node, source):
         proxmox: ProxmoxAPI handle.
         node: Proxmox node name.
         source: Source container dict (must have 'vmid' and 'name').
+        used_vmids: Optional set of VMIDs already allocated in batch.
 
     Returns a config dict for the clone operation.
     """
-    suggested_id = next_vmid(proxmox)
+    suggested_id = next_vmid(proxmox, used_vmids)
     source_vmid = source.get("vmid", "?")
     source_name = source.get("name", "(unnamed)")
 
@@ -951,73 +957,78 @@ def configure_clone(proxmox, node, source):
     return config
 
 
-def confirm_and_clone(proxmox, node, source, config):
-    """Show a summary and execute the LXC clone upon confirmation."""
+def confirm_and_clone(proxmox, node, source, configs):
+    """Show a summary and execute LXC clone(s) upon confirmation."""
+    if not isinstance(configs, list):
+        configs = [configs]
+
+    count = len(configs)
     source_vmid = source.get("vmid", "?")
     source_name = source.get("name", "(unnamed)")
 
-    clone_type_label = "Full" if config["full_clone"] else "Linked"
-    storage_label = config["target_storage"] or "(same as source)"
+    header = f"Clone Summary ({count} clone{'s' if count > 1 else ''})"
+    print(f"\n┌─────────────────────────────────────────────┐")
+    print(f"│  {header:<43}│")
+    print(f"└─────────────────────────────────────────────┘")
+    print(f"  Source: CT {source_vmid} — {source_name}")
 
-    summary = textwrap.dedent(f"""
-    ┌─────────────────────────────────────────────┐
-    │              Clone Summary                   │
-    └─────────────────────────────────────────────┘
+    for idx, config in enumerate(configs, start=1):
+        clone_type_label = "Full" if config["full_clone"] else "Linked"
+        storage_label = config["target_storage"] or "(same as source)"
+        if count > 1:
+            print(f"\n  ── Clone #{idx} ──")
+        print(f"  New VMID:       {config['new_vmid']}")
+        print(f"  New hostname:   {config['hostname']}")
+        print(f"  Clone type:     {clone_type_label}")
+        print(f"  Target storage: {storage_label}")
+        print(f"  Description:    {config['description']}")
+        print(f"  Start after:    {'Yes' if config['start_after'] else 'No'}")
+        print(f"  Node:           {node}")
 
-      Source:         CT {source_vmid} — {source_name}
-      New VMID:       {config['new_vmid']}
-      New hostname:   {config['hostname']}
-      Clone type:     {clone_type_label}
-      Target storage: {storage_label}
-      Description:    {config['description']}
-      Start after:    {'Yes' if config['start_after'] else 'No'}
-      Node:           {node}
-    """)
-    print(summary)
-
-    confirm = input("  Proceed with clone? (y/n): ").strip().lower()
+    confirm = input(f"\n  Proceed with cloning {count} container(s)? (y/n): ").strip().lower()
     if confirm not in ("y", "yes"):
         print("\n  ✗ Aborted.\n")
         return
 
-    # Build the API payload
-    payload = {
-        "newid": config["new_vmid"],
-        "hostname": config["hostname"],
-        "full": config["full_clone"],
-        "description": config["description"],
-    }
-    if config["target_storage"]:
-        payload["storage"] = config["target_storage"]
+    for idx, config in enumerate(configs, start=1):
+        if count > 1:
+            print(f"\n  ━━ Cloning container {idx}/{count}: {config['hostname']} (VMID {config['new_vmid']}) ━━")
 
-    print("\n  ⟳ Cloning container …")
+        payload = {
+            "newid": config["new_vmid"],
+            "hostname": config["hostname"],
+            "full": config["full_clone"],
+            "description": config["description"],
+        }
+        if config["target_storage"]:
+            payload["storage"] = config["target_storage"]
 
-    try:
-        task_id = proxmox.nodes(node).lxc(source_vmid).clone.post(**payload)
-        print(f"  ✓ Task started: {task_id}")
-    except Exception as exc:
-        print(f"\n  ✗ Failed to clone container: {exc}\n")
-        return
+        print(f"\n  ⟳ Cloning container {config['new_vmid']} …")
 
-    # Wait for the task to finish
-    print("  ⟳ Waiting for clone to complete …")
-    try:
-        wait_for_task(proxmox, node, task_id, timeout=300)
-    except Exception as exc:
-        print(f"\n  ⚠ Could not verify task completion: {exc}")
-        print("    Check the Proxmox UI for task status.\n")
-        return
-
-    print(f"  ✓ Container {config['new_vmid']} cloned successfully!\n")
-
-    # Optionally start the cloned container
-    if config["start_after"]:
-        print("  ⟳ Starting cloned container …")
         try:
-            proxmox.nodes(node).lxc(config["new_vmid"]).status.start.post()
-            print(f"  ✓ Container {config['new_vmid']} is now running.\n")
+            task_id = proxmox.nodes(node).lxc(source_vmid).clone.post(**payload)
+            print(f"  ✓ Task started: {task_id}")
         except Exception as exc:
-            print(f"  ⚠ Failed to start container: {exc}\n")
+            print(f"\n  ✗ Failed to clone container {config['new_vmid']}: {exc}\n")
+            continue
+
+        print("  ⟳ Waiting for clone to complete …")
+        try:
+            wait_for_task(proxmox, node, task_id, timeout=300)
+        except Exception as exc:
+            print(f"\n  ⚠ Could not verify task completion for CT {config['new_vmid']}: {exc}")
+            print("    Check the Proxmox UI for task status.\n")
+            continue
+
+        print(f"  ✓ Container {config['new_vmid']} cloned successfully!\n")
+
+        if config["start_after"]:
+            print(f"  ⟳ Starting cloned container {config['new_vmid']} …")
+            try:
+                proxmox.nodes(node).lxc(config["new_vmid"]).status.start.post()
+                print(f"  ✓ Container {config['new_vmid']} is now running.\n")
+            except Exception as exc:
+                print(f"  ⚠ Failed to start container {config['new_vmid']}: {exc}\n")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1038,13 +1049,13 @@ OS_TYPES = [
 ]
 
 
-def configure_vm(proxmox, node):
+def configure_vm(proxmox, node, used_vmids=None):
     """
-    Interactively collect all settings for the new virtual machine.
+    Interactively collect all settings for a new virtual machine.
 
     Returns a config dict with all VM parameters.
     """
-    suggested_id = next_vmid(proxmox)
+    suggested_id = next_vmid(proxmox, used_vmids)
 
     print("┌─────────────────────────────────────────────┐")
     print("│       New Virtual Machine Configuration     │")
@@ -1150,97 +1161,101 @@ def configure_vm(proxmox, node):
     return config
 
 
-def confirm_and_create_vm(proxmox, node, iso, storage, config):
-    """Show a summary and create the VM upon confirmation."""
+def confirm_and_create_vm(proxmox, node, iso, storage, configs):
+    """Show a summary and create VM(s) upon confirmation."""
+    if not isinstance(configs, list):
+        configs = [configs]
 
-    summary = textwrap.dedent(f"""
-    ┌─────────────────────────────────────────────┐
-    │            Virtual Machine Summary           │
-    └─────────────────────────────────────────────┘
+    count = len(configs)
+    header = f"Virtual Machine Summary ({count} VM{'s' if count > 1 else ''})"
+    print(f"\n┌─────────────────────────────────────────────┐")
+    print(f"│  {header:<43}│")
+    print(f"└─────────────────────────────────────────────┘")
 
-      VMID:           {config['vmid']}
-      Name:           {config['name']}
-      OS type:        {config['ostype']}
-      BIOS:           {config['bios']}
-      ISO:            {iso['filename']}
-      Storage:        {storage}
-      CPU:            {config['sockets']} socket(s) × {config['cores']} core(s)  [{config['cpu_type']}]
-      Memory:         {config['memory']} MB
-      Balloon:        {config['balloon']} MB
-      Disk:           {config['disk_size']} GB
-      SCSI:           {config['scsihw']}
-      Network:        {config['net_model']}, bridge={config['bridge']}
-      Firewall:       {'Yes' if config['firewall'] else 'No'}
-      Display:        {config['vga']}
-      QEMU agent:     {'Yes' if config['agent'] else 'No'}
-      On boot:        {'Yes' if config['onboot'] else 'No'}
-      Start after:    {'Yes' if config['start_after'] else 'No'}
-      Node:           {node}
-    """)
-    print(summary)
+    for idx, config in enumerate(configs, start=1):
+        if count > 1:
+            print(f"\n  ── VM #{idx} ──")
+        print(f"  VMID:           {config['vmid']}")
+        print(f"  Name:           {config['name']}")
+        print(f"  OS type:        {config['ostype']}")
+        print(f"  BIOS:           {config['bios']}")
+        print(f"  ISO:            {iso['filename']}")
+        print(f"  Storage:        {storage}")
+        print(f"  CPU:            {config['sockets']} socket(s) × {config['cores']} core(s)  [{config['cpu_type']}]")
+        print(f"  Memory:         {config['memory']} MB")
+        print(f"  Balloon:        {config['balloon']} MB")
+        print(f"  Disk:           {config['disk_size']} GB")
+        print(f"  SCSI:           {config['scsihw']}")
+        print(f"  Network:        {config['net_model']}, bridge={config['bridge']}")
+        print(f"  Firewall:       {'Yes' if config['firewall'] else 'No'}")
+        print(f"  Display:        {config['vga']}")
+        print(f"  QEMU agent:     {'Yes' if config['agent'] else 'No'}")
+        print(f"  On boot:        {'Yes' if config['onboot'] else 'No'}")
+        print(f"  Start after:    {'Yes' if config['start_after'] else 'No'}")
+        print(f"  Node:           {node}")
 
-    confirm = input("  Proceed with VM creation? (y/n): ").strip().lower()
+    confirm = input(f"\n  Proceed with creation of {count} VM(s)? (y/n): ").strip().lower()
     if confirm not in ("y", "yes"):
         print("\n  ✗ Aborted.\n")
         return
 
-    # Build the API payload
-    net0 = f"{config['net_model']},bridge={config['bridge']}"
-    if config["firewall"]:
-        net0 += ",firewall=1"
+    for idx, config in enumerate(configs, start=1):
+        if count > 1:
+            print(f"\n  ━━ Creating VM {idx}/{count}: {config['name']} (VMID {config['vmid']}) ━━")
 
-    payload = {
-        "vmid": config["vmid"],
-        "name": config["name"],
-        "ostype": config["ostype"],
-        "bios": config["bios"],
-        "sockets": config["sockets"],
-        "cores": config["cores"],
-        "cpu": config["cpu_type"],
-        "memory": config["memory"],
-        "balloon": config["balloon"],
-        "scsihw": config["scsihw"],
-        "scsi0": f"{storage}:{config['disk_size']}",
-        "ide2": f"{iso['volid']},media=cdrom",
-        "net0": net0,
-        "vga": config["vga"],
-        "onboot": config["onboot"],
-        "agent": config["agent"],
-        "boot": "order=ide2;scsi0",
-    }
+        net0 = f"{config['net_model']},bridge={config['bridge']}"
+        if config["firewall"]:
+            net0 += ",firewall=1"
 
-    # Add EFI disk if using OVMF
-    if config["bios"] == "ovmf":
-        payload["efidisk0"] = f"{storage}:1"
+        payload = {
+            "vmid": config["vmid"],
+            "name": config["name"],
+            "ostype": config["ostype"],
+            "bios": config["bios"],
+            "sockets": config["sockets"],
+            "cores": config["cores"],
+            "cpu": config["cpu_type"],
+            "memory": config["memory"],
+            "balloon": config["balloon"],
+            "scsihw": config["scsihw"],
+            "scsi0": f"{storage}:{config['disk_size']}",
+            "ide2": f"{iso['volid']},media=cdrom",
+            "net0": net0,
+            "vga": config["vga"],
+            "onboot": config["onboot"],
+            "agent": config["agent"],
+            "boot": "order=ide2;scsi0",
+        }
 
-    print("\n  ⟳ Creating virtual machine …")
+        if config["bios"] == "ovmf":
+            payload["efidisk0"] = f"{storage}:1"
 
-    try:
-        task_id = proxmox.nodes(node).qemu.create(**payload)
-        print(f"  ✓ Task started: {task_id}")
-    except Exception as exc:
-        print(f"\n  ✗ Failed to create VM: {exc}\n")
-        return
+        print(f"\n  ⟳ Creating virtual machine {config['vmid']} …")
 
-    # Wait for the task to finish
-    print("  ⟳ Waiting for task to complete …")
-    try:
-        wait_for_task(proxmox, node, task_id)
-    except Exception as exc:
-        print(f"\n  ⚠ Could not verify task completion: {exc}")
-        print("    Check the Proxmox UI for task status.\n")
-        return
-
-    print(f"  ✓ VM {config['vmid']} created successfully!\n")
-
-    # Optionally start the VM
-    if config["start_after"]:
-        print("  ⟳ Starting virtual machine …")
         try:
-            proxmox.nodes(node).qemu(config["vmid"]).status.start.post()
-            print(f"  ✓ VM {config['vmid']} is now running.\n")
+            task_id = proxmox.nodes(node).qemu.create(**payload)
+            print(f"  ✓ Task started: {task_id}")
         except Exception as exc:
-            print(f"  ⚠ Failed to start VM: {exc}\n")
+            print(f"\n  ✗ Failed to create VM {config['vmid']}: {exc}\n")
+            continue
+
+        print("  ⟳ Waiting for task to complete …")
+        try:
+            wait_for_task(proxmox, node, task_id)
+        except Exception as exc:
+            print(f"\n  ⚠ Could not verify task completion for VM {config['vmid']}: {exc}")
+            print("    Check the Proxmox UI for task status.\n")
+            continue
+
+        print(f"  ✓ VM {config['vmid']} created successfully!\n")
+
+        if config["start_after"]:
+            print(f"  ⟳ Starting virtual machine {config['vmid']} …")
+            try:
+                proxmox.nodes(node).qemu(config["vmid"]).status.start.post()
+                print(f"  ✓ VM {config['vmid']} is now running.\n")
+            except Exception as exc:
+                print(f"  ⚠ Failed to start VM {config['vmid']}: {exc}\n")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1305,7 +1320,7 @@ def pick_vm_template(proxmox, node):
         print("  ✗ Invalid selection, try again.")
 
 
-def configure_vm_clone(proxmox, node, source):
+def configure_vm_clone(proxmox, node, source, used_vmids=None):
     """
     Interactively collect settings for cloning a VM from a template.
 
@@ -1313,10 +1328,11 @@ def configure_vm_clone(proxmox, node, source):
         proxmox: ProxmoxAPI handle.
         node: Proxmox node name.
         source: Source VM template dict (must have 'vmid' and 'name').
+        used_vmids: Optional set of VMIDs already allocated in batch.
 
     Returns a config dict for the clone operation.
     """
-    suggested_id = next_vmid(proxmox)
+    suggested_id = next_vmid(proxmox, used_vmids)
     source_vmid = source.get("vmid", "?")
     source_name = source.get("name", "(unnamed)")
 
@@ -1385,77 +1401,82 @@ def configure_vm_clone(proxmox, node, source):
     return config
 
 
-def confirm_and_clone_vm(proxmox, node, source, config):
-    """Show a summary and execute the VM template clone upon confirmation."""
+def confirm_and_clone_vm(proxmox, node, source, configs):
+    """Show a summary and execute VM template clone(s) upon confirmation."""
+    if not isinstance(configs, list):
+        configs = [configs]
+
+    count = len(configs)
     source_vmid = source.get("vmid", "?")
     source_name = source.get("name", "(unnamed)")
 
-    clone_type_label = "Full" if config["full_clone"] else "Linked"
-    storage_label = config["target_storage"] or "(same as source)"
-    format_label = config["disk_format"] or "(same as source)"
+    header = f"VM Clone Summary ({count} clone{'s' if count > 1 else ''})"
+    print(f"\n┌─────────────────────────────────────────────┐")
+    print(f"│  {header:<43}│")
+    print(f"└─────────────────────────────────────────────┘")
+    print(f"  Source: VM {source_vmid} — {source_name}")
 
-    summary = textwrap.dedent(f"""
-    ┌─────────────────────────────────────────────┐
-    │           VM Clone Summary                   │
-    └─────────────────────────────────────────────┘
+    for idx, config in enumerate(configs, start=1):
+        clone_type_label = "Full" if config["full_clone"] else "Linked"
+        storage_label = config["target_storage"] or "(same as source)"
+        format_label = config["disk_format"] or "(same as source)"
+        if count > 1:
+            print(f"\n  ── VM Clone #{idx} ──")
+        print(f"  New VMID:       {config['new_vmid']}")
+        print(f"  New name:       {config['name']}")
+        print(f"  Clone type:     {clone_type_label}")
+        print(f"  Target storage: {storage_label}")
+        print(f"  Disk format:    {format_label}")
+        print(f"  Description:    {config['description']}")
+        print(f"  Start after:    {'Yes' if config['start_after'] else 'No'}")
+        print(f"  Node:           {node}")
 
-      Source:         VM {source_vmid} — {source_name}
-      New VMID:       {config['new_vmid']}
-      New name:       {config['name']}
-      Clone type:     {clone_type_label}
-      Target storage: {storage_label}
-      Disk format:    {format_label}
-      Description:    {config['description']}
-      Start after:    {'Yes' if config['start_after'] else 'No'}
-      Node:           {node}
-    """)
-    print(summary)
-
-    confirm = input("  Proceed with VM clone? (y/n): ").strip().lower()
+    confirm = input(f"\n  Proceed with VM clone of {count} VM(s)? (y/n): ").strip().lower()
     if confirm not in ("y", "yes"):
         print("\n  ✗ Aborted.\n")
         return
 
-    # Build the API payload
-    payload = {
-        "newid": config["new_vmid"],
-        "name": config["name"],
-        "full": config["full_clone"],
-        "description": config["description"],
-    }
-    if config["target_storage"]:
-        payload["storage"] = config["target_storage"]
-    if config["disk_format"]:
-        payload["format"] = config["disk_format"]
+    for idx, config in enumerate(configs, start=1):
+        if count > 1:
+            print(f"\n  ━━ Cloning VM {idx}/{count}: {config['name']} (VMID {config['new_vmid']}) ━━")
 
-    print("\n  ⟳ Cloning virtual machine …")
+        payload = {
+            "newid": config["new_vmid"],
+            "name": config["name"],
+            "full": config["full_clone"],
+            "description": config["description"],
+        }
+        if config["target_storage"]:
+            payload["storage"] = config["target_storage"]
+        if config["disk_format"]:
+            payload["format"] = config["disk_format"]
 
-    try:
-        task_id = proxmox.nodes(node).qemu(source_vmid).clone.post(**payload)
-        print(f"  ✓ Task started: {task_id}")
-    except Exception as exc:
-        print(f"\n  ✗ Failed to clone VM: {exc}\n")
-        return
+        print(f"\n  ⟳ Cloning virtual machine {config['new_vmid']} …")
 
-    # Wait for the task to finish
-    print("  ⟳ Waiting for clone to complete …")
-    try:
-        wait_for_task(proxmox, node, task_id, timeout=600)
-    except Exception as exc:
-        print(f"\n  ⚠ Could not verify task completion: {exc}")
-        print("    Check the Proxmox UI for task status.\n")
-        return
-
-    print(f"  ✓ VM {config['new_vmid']} cloned successfully!\n")
-
-    # Optionally start the cloned VM
-    if config["start_after"]:
-        print("  ⟳ Starting cloned virtual machine …")
         try:
-            proxmox.nodes(node).qemu(config["new_vmid"]).status.start.post()
-            print(f"  ✓ VM {config['new_vmid']} is now running.\n")
+            task_id = proxmox.nodes(node).qemu(source_vmid).clone.post(**payload)
+            print(f"  ✓ Task started: {task_id}")
         except Exception as exc:
-            print(f"  ⚠ Failed to start VM: {exc}\n")
+            print(f"\n  ✗ Failed to clone VM {config['new_vmid']}: {exc}\n")
+            continue
+
+        print("  ⟳ Waiting for clone to complete …")
+        try:
+            wait_for_task(proxmox, node, task_id, timeout=600)
+        except Exception as exc:
+            print(f"\n  ⚠ Could not verify task completion for VM {config['new_vmid']}: {exc}")
+            print("    Check the Proxmox UI for task status.\n")
+            continue
+
+        print(f"  ✓ VM {config['new_vmid']} cloned successfully!\n")
+
+        if config["start_after"]:
+            print(f"  ⟳ Starting cloned virtual machine {config['new_vmid']} …")
+            try:
+                proxmox.nodes(node).qemu(config["new_vmid"]).status.start.post()
+                print(f"  ✓ VM {config['new_vmid']} is now running.\n")
+            except Exception as exc:
+                print(f"  ⚠ Failed to start VM {config['new_vmid']}: {exc}\n")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -1746,6 +1767,15 @@ def delete_vms(proxmox, node):
 
 def create_lxc_flow(proxmox, node, host, token_id, token_secret):
     """Run the interactive LXC container-creation workflow."""
+    print("┌─────────────────────────────────────────────┐")
+    print("│         Create LXC Container(s)             │")
+    print("└─────────────────────────────────────────────┘\n")
+
+    count = prompt_value("Number of LXC containers to create", default=1, cast=int)
+    if count < 1:
+        print("  ✗ Count must be at least 1.\n")
+        return
+
     # Pick a template (existing or upload a custom one)
     templates = list_templates(proxmox, node)
     template = pick_template(
@@ -1755,11 +1785,18 @@ def create_lxc_flow(proxmox, node, host, token_id, token_secret):
     # Pick storage
     storage = pick_storage(proxmox, node)
 
-    # Configure the new container
-    config = configure_container(proxmox, node)
+    # Configure each container
+    used_vmids = set()
+    configs = []
+    for i in range(1, count + 1):
+        if count > 1:
+            print(f"\n── Container {i} of {count} Configuration ──")
+        config = configure_container(proxmox, node, used_vmids=used_vmids)
+        used_vmids.add(config["vmid"])
+        configs.append(config)
 
     # Confirm and create
-    confirm_and_create(proxmox, node, template, storage, config)
+    confirm_and_create(proxmox, node, template, storage, configs)
 
 
 def clone_lxc_flow(proxmox, node):
@@ -1770,15 +1807,36 @@ def clone_lxc_flow(proxmox, node):
         print("  ✗ No clone source selected. Returning to menu.\n")
         return
 
-    # Configure the clone
-    config = configure_clone(proxmox, node, source)
+    count = prompt_value("Number of LXC clones to create", default=1, cast=int)
+    if count < 1:
+        print("  ✗ Count must be at least 1.\n")
+        return
+
+    # Configure each clone
+    used_vmids = set()
+    configs = []
+    for i in range(1, count + 1):
+        if count > 1:
+            print(f"\n── Clone {i} of {count} Configuration ──")
+        config = configure_clone(proxmox, node, source, used_vmids=used_vmids)
+        used_vmids.add(config["new_vmid"])
+        configs.append(config)
 
     # Confirm and clone
-    confirm_and_clone(proxmox, node, source, config)
+    confirm_and_clone(proxmox, node, source, configs)
 
 
 def create_vm_flow(proxmox, node, host, token_id, token_secret):
     """Run the interactive VM-creation workflow."""
+    print("┌─────────────────────────────────────────────┐")
+    print("│         Create Virtual Machine(s)           │")
+    print("└─────────────────────────────────────────────┘\n")
+
+    count = prompt_value("Number of VMs to create", default=1, cast=int)
+    if count < 1:
+        print("  ✗ Count must be at least 1.\n")
+        return
+
     # Pick an ISO (existing or upload one)
     isos = list_isos(proxmox, node)
     iso = pick_iso(proxmox, node, host, token_id, token_secret, isos)
@@ -1791,11 +1849,18 @@ def create_vm_flow(proxmox, node, host, token_id, token_secret):
     print("  ── VM Disk Storage ──\n")
     storage = pick_storage(proxmox, node, content_filter="images")
 
-    # Configure the new VM
-    config = configure_vm(proxmox, node)
+    # Configure each VM
+    used_vmids = set()
+    configs = []
+    for i in range(1, count + 1):
+        if count > 1:
+            print(f"\n── VM {i} of {count} Configuration ──")
+        config = configure_vm(proxmox, node, used_vmids=used_vmids)
+        used_vmids.add(config["vmid"])
+        configs.append(config)
 
     # Confirm and create
-    confirm_and_create_vm(proxmox, node, iso, storage, config)
+    confirm_and_create_vm(proxmox, node, iso, storage, configs)
 
 
 def clone_vm_flow(proxmox, node):
@@ -1806,11 +1871,23 @@ def clone_vm_flow(proxmox, node):
         print("  ✗ No VM template selected. Returning to menu.\n")
         return
 
-    # Configure the clone
-    config = configure_vm_clone(proxmox, node, source)
+    count = prompt_value("Number of VM clones to create", default=1, cast=int)
+    if count < 1:
+        print("  ✗ Count must be at least 1.\n")
+        return
+
+    # Configure each clone
+    used_vmids = set()
+    configs = []
+    for i in range(1, count + 1):
+        if count > 1:
+            print(f"\n── VM Clone {i} of {count} Configuration ──")
+        config = configure_vm_clone(proxmox, node, source, used_vmids=used_vmids)
+        used_vmids.add(config["new_vmid"])
+        configs.append(config)
 
     # Confirm and clone
-    confirm_and_clone_vm(proxmox, node, source, config)
+    confirm_and_clone_vm(proxmox, node, source, configs)
 
 
 
