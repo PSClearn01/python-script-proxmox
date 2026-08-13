@@ -34,14 +34,16 @@ An interactive Python script that creates, clones, and deletes LXC containers an
 - **Auto-start** — optionally start containers or VMs immediately after creation or cloning
 - **Container & VM deletion** — list LXC containers and QEMU VMs with multi-select deletion (individual numbers, `all`, or `q` to cancel)
 - **Safe deletion workflow** — automatically stops running containers and VMs before deletion, guarded by a mandatory `yes` confirmation prompt
-- **Expanded main menu** — interactive main menu with 7 structured options to manage single or batch containers and VMs in a single session without restarting the script:
+- **Mass VM & LXC disk migration** — batch move disk volumes and mountpoints across Proxmox storage pools with support for filtering by resource scope (VMs/LXCs), filtering by source storage pool, or multi-selecting specific instances
+- **Expanded main menu** — interactive main menu with 8 structured options to manage single or batch containers, VMs, and disk storage migrations in a single session without restarting the script:
   1. **Create LXC from template**
   2. **Clone an existing LXC container**
   3. **Delete LXC container(s)**
   4. **Create VM from ISO**
   5. **Clone VM from template**
   6. **Delete VM(s)**
-  7. **Exit**
+  7. **Mass migrate VM & LXC disks**
+  8. **Exit**
 - **Secure credentials** — API token and host stored in a `.env` file, kept out of version control
 - **Smart defaults** — auto-suggests next available VMID (preventing batch conflicts) and sensible resource defaults
 

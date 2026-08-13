@@ -11,6 +11,7 @@ Features:
   • Create QEMU VMs from ISO images in single or batch mode (with optional ISO upload)
   • Clone QEMU VMs from VM templates in single or batch mode (full or linked clones)
   • Delete LXC containers and QEMU VMs (individual or multi-select)
+  • Mass migrate VM and LXC disks across storage pools (batch or filtered)
 
 Authenticates via API token loaded from a .env file.
 
@@ -26,6 +27,7 @@ import getpass
 import time
 import textwrap
 import mimetypes
+import re
 
 import requests
 import urllib3
@@ -1890,6 +1892,359 @@ def clone_vm_flow(proxmox, node):
     confirm_and_clone_vm(proxmox, node, source, configs)
 
 
+# ──────────────────────────────────────────────────────────────
+# VM & LXC Mass Disk Migration
+# ──────────────────────────────────────────────────────────────
+
+def get_vm_disks(proxmox, node, vmid):
+    """
+    Get all move-eligible disk volumes for a QEMU VM.
+
+    Returns a list of dicts:
+    [{'key': 'scsi0', 'storage': 'local-lvm', 'volume': 'vm-100-disk-0', 'raw_value': '...'}, ...]
+    """
+    try:
+        config = proxmox.nodes(node).qemu(vmid).config.get()
+    except Exception:
+        return []
+
+    disks = []
+    # Match scsi, virtio, sata, ide, efidisk, tpmstate keys followed by digits
+    disk_pattern = re.compile(r'^(scsi|virtio|sata|ide|efidisk|tpmstate)\d+$')
+
+    for key, val in config.items():
+        if not isinstance(val, str):
+            continue
+        if not disk_pattern.match(key):
+            continue
+        # Exclude CD-ROM, CloudInit, and unassigned/none entries
+        if 'media=cdrom' in val or 'cloudinit' in val or val.startswith('none'):
+            continue
+        if ':' in val:
+            parts = val.split(':', 1)
+            storage_name = parts[0].strip()
+            rest = parts[1].split(',')[0].strip()
+            disks.append({
+                'key': key,
+                'storage': storage_name,
+                'volume': rest,
+                'raw_value': val
+            })
+    return disks
+
+
+def get_lxc_disks(proxmox, node, vmid):
+    """
+    Get all move-eligible disk volumes / mountpoints for an LXC container.
+
+    Returns a list of dicts:
+    [{'key': 'rootfs', 'storage': 'local-lvm', 'volume': 'subvol-105-disk-0', 'raw_value': '...'}, ...]
+    """
+    try:
+        config = proxmox.nodes(node).lxc(vmid).config.get()
+    except Exception:
+        return []
+
+    disks = []
+    # Match rootfs or mp<digits> keys
+    lxc_pattern = re.compile(r'^(rootfs|mp\d+)$')
+
+    for key, val in config.items():
+        if not isinstance(val, str):
+            continue
+        if not lxc_pattern.match(key):
+            continue
+        if ':' in val:
+            parts = val.split(':', 1)
+            storage_name = parts[0].strip()
+            rest = parts[1].split(',')[0].strip()
+            disks.append({
+                'key': key,
+                'storage': storage_name,
+                'volume': rest,
+                'raw_value': val
+            })
+    return disks
+
+
+def discover_all_disks(proxmox, node, include_vms=True, include_lxcs=True):
+    """
+    Scan the node for all VMs and LXCs and collect their move-eligible disks.
+
+    Returns a list of dicts:
+    [{'vmid': 100, 'name': 'ubuntu', 'type': 'VM', 'disk_key': 'scsi0',
+      'storage': 'local-lvm', 'volume': 'vm-100-disk-0', 'status': 'running'}, ...]
+    """
+    all_disks = []
+
+    if include_vms:
+        vms = list_vms(proxmox, node)
+        for vm in sorted(vms, key=lambda x: int(x.get('vmid', 0))):
+            vmid = int(vm.get('vmid'))
+            name = vm.get('name', f'VM-{vmid}')
+            status = vm.get('status', 'unknown')
+            vm_disks = get_vm_disks(proxmox, node, vmid)
+            for d in vm_disks:
+                all_disks.append({
+                    'vmid': vmid,
+                    'name': name,
+                    'type': 'VM',
+                    'disk_key': d['key'],
+                    'storage': d['storage'],
+                    'volume': d['volume'],
+                    'status': status
+                })
+
+    if include_lxcs:
+        cts = list_containers(proxmox, node)
+        for ct in sorted(cts, key=lambda x: int(x.get('vmid', 0))):
+            vmid = int(ct.get('vmid'))
+            name = ct.get('name', f'CT-{vmid}')
+            status = ct.get('status', 'unknown')
+            ct_disks = get_lxc_disks(proxmox, node, vmid)
+            for d in ct_disks:
+                all_disks.append({
+                    'vmid': vmid,
+                    'name': name,
+                    'type': 'LXC',
+                    'disk_key': d['key'],
+                    'storage': d['storage'],
+                    'volume': d['volume'],
+                    'status': status
+                })
+
+    return all_disks
+
+
+def mass_migrate_disks_flow(proxmox, node):
+    """
+    Interactive workflow to mass migrate VM and LXC disks to a target storage pool.
+    """
+    print("\n┌─────────────────────────────────────────────┐")
+    print("│         Mass Disk Migration Flow            │")
+    print("└─────────────────────────────────────────────┘")
+
+    # Step 1: Select resource scope
+    print("\n  Select resource type to migrate:")
+    print("  [1]  Virtual Machines (VMs) only")
+    print("  [2]  LXC Containers only")
+    print("  [3]  Both VMs and LXC Containers")
+    print("  [4]  Cancel")
+
+    scope_choice = input("\n  Select an option [3]: ").strip()
+    if scope_choice == "":
+        scope_choice = "3"
+
+    if scope_choice == "4" or scope_choice not in ("1", "2", "3"):
+        if scope_choice not in ("1", "2", "3", "4"):
+            print("  ✗ Invalid choice, cancelling operation.")
+        return
+
+    include_vms = scope_choice in ("1", "3")
+    include_lxcs = scope_choice in ("2", "3")
+
+    print("\n  ⟳ Scanning node for VMs/LXCs and move-eligible disks …")
+    all_disks = discover_all_disks(proxmox, node, include_vms=include_vms, include_lxcs=include_lxcs)
+
+    if not all_disks:
+        print("\n  ✗ No move-eligible VM or LXC disks found on this node.\n")
+        return
+
+    print(f"  ✓ Discovered {len(all_disks)} disk volume(s) across selected resources.\n")
+
+    # Step 2: Select filtering / scope method
+    print("┌─────────────────────────────────────────────┐")
+    print("│       Select Migration Scope / Filter       │")
+    print("├─────────────────────────────────────────────┤")
+    print("│  [1]  Filter by Source Storage Pool          │")
+    print("│       (Migrate all disks currently on a     │")
+    print("│        specific storage)                    │")
+    print("│  [2]  Multi-select specific VMs / LXCs      │")
+    print("│       (Choose specific VMs or CTs to move)  │")
+    print("│  [3]  Migrate ALL discovered disks          │")
+    print("│  [4]  Cancel                                │")
+    print("└─────────────────────────────────────────────┘")
+
+    filter_choice = input("\n  Select filter mode [1]: ").strip()
+    if filter_choice == "":
+        filter_choice = "1"
+
+    if filter_choice == "4" or filter_choice not in ("1", "2", "3"):
+        if filter_choice not in ("1", "2", "3", "4"):
+            print("  ✗ Invalid choice, cancelling operation.")
+        return
+
+    selected_disks = []
+
+    if filter_choice == "1":
+        # Filter by source storage pool
+        source_storages = sorted(list(set(d['storage'] for d in all_disks)))
+        print("\n┌─────────────────────────────────────────────┐")
+        print("│        Active Source Storage Pools          │")
+        print("└─────────────────────────────────────────────┘")
+        for idx, src_st in enumerate(source_storages, start=1):
+            disk_cnt = sum(1 for d in all_disks if d['storage'] == src_st)
+            print(f"  [{idx:>2}]  {src_st} ({disk_cnt} disk(s))")
+
+        while True:
+            choice = input("\n  Select source storage pool number: ").strip()
+            if choice.isdigit() and 1 <= int(choice) <= len(source_storages):
+                selected_source = source_storages[int(choice) - 1]
+                print(f"\n  ✓ Selected source storage: {selected_source}\n")
+                break
+            print("  ✗ Invalid selection, try again.")
+
+        selected_disks = [d for d in all_disks if d['storage'] == selected_source]
+
+    elif filter_choice == "2":
+        # Multi-select specific VMs / LXCs
+        grouped = {}
+        for d in all_disks:
+            key = (d['type'], d['vmid'], d['name'], d['status'])
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(d)
+
+        resource_keys = sorted(grouped.keys(), key=lambda k: (k[0], k[1]))
+
+        print("\n┌─────────────────────────────────────────────┐")
+        print("│            Available Resources              │")
+        print("└─────────────────────────────────────────────┘")
+        for idx, rkey in enumerate(resource_keys, start=1):
+            rtype, vmid, name, status = rkey
+            status_icon = "🟢" if status == "running" else "⚫"
+            r_disks = grouped[rkey]
+            disk_summary = ", ".join(f"{d['disk_key']} [{d['storage']}]" for d in r_disks)
+            print(f"  [{idx:>2}]  {status_icon}  {rtype} {vmid} — {name}")
+            print(f"        disks ({len(r_disks)}): {disk_summary}")
+
+        print("\n  Enter numbers to select (comma-separated, e.g. 1,3), 'all', or 'q' to cancel.")
+        while True:
+            choice = input("\n  Selection: ").strip().lower()
+            if choice in ("q", "quit", "cancel"):
+                return
+            if choice == "all":
+                chosen_keys = resource_keys
+                break
+
+            parts = [p.strip() for p in choice.split(",")]
+            chosen_keys = []
+            valid = True
+            for part in parts:
+                if not part.isdigit():
+                    valid = False
+                    break
+                idx = int(part)
+                if 1 <= idx <= len(resource_keys):
+                    chosen_keys.append(resource_keys[idx - 1])
+                else:
+                    valid = False
+                    break
+            if valid and chosen_keys:
+                break
+            print("  ✗ Invalid selection, please try again.")
+
+        for rkey in chosen_keys:
+            selected_disks.extend(grouped[rkey])
+
+        # Optional: Filter selected resources by specific source storage pool if multiple exist
+        unique_src = sorted(list(set(d['storage'] for d in selected_disks)))
+        if len(unique_src) > 1:
+            print(f"\n  Selected resources have disks across multiple storages: {', '.join(unique_src)}")
+            src_filter = prompt_value("Filter selected resources by specific source storage pool? (leave blank for ALL storages)", default="ALL")
+            if src_filter != "ALL" and src_filter in unique_src:
+                selected_disks = [d for d in selected_disks if d['storage'] == src_filter]
+
+    elif filter_choice == "3":
+        selected_disks = list(all_disks)
+
+    if not selected_disks:
+        print("\n  ✗ No disks selected for migration.\n")
+        return
+
+    # Step 3: Pick Target Storage Pool
+    print("\nSelect target storage pool for migration:")
+    target_storage = pick_storage(proxmox, node)
+
+    # Filter out disks already on target storage
+    disks_to_migrate = [d for d in selected_disks if d['storage'] != target_storage]
+    already_on_target = [d for d in selected_disks if d['storage'] == target_storage]
+
+    if already_on_target:
+        print(f"  ℹ  Skipping {len(already_on_target)} disk(s) already residing on target storage '{target_storage}'.")
+
+    if not disks_to_migrate:
+        print(f"\n  ✓ All selected disks are already on target storage '{target_storage}'. Nothing to migrate.\n")
+        return
+
+    # Step 4: Confirm Delete Original
+    delete_orig_str = prompt_value("Delete original disk from source storage after move? (y/n)", default="y").lower()
+    delete_orig = delete_orig_str in ("y", "yes", "true", "1")
+
+    # Step 5: Confirmation Summary
+    print("\n┌─────────────────────────────────────────────────────────────────────────┐")
+    print("│                     Mass Disk Migration Summary                         │")
+    print("├─────────────────────────────────────────────────────────────────────────┤")
+    print(f"│  Target Storage Pool: {target_storage:<50}│")
+    print(f"│  Delete Original:     {'Yes' if delete_orig else 'No':<50}│")
+    print(f"│  Total Disks to Move: {len(disks_to_migrate):<50}│")
+    print("├──────┬──────┬─────────────────┬──────────┬────────────────┬─────────────┤")
+    print("│ Type │ VMID │ Name            │ Disk Key │ Source Storage │ Status      │")
+    print("├──────┼──────┼─────────────────┼──────────┼────────────────┼─────────────┤")
+    for d in disks_to_migrate:
+        name_trunc = d['name'][:15]
+        print(f"│ {d['type']:<4} │ {d['vmid']:<4} │ {name_trunc:<15} │ {d['disk_key']:<8} │ {d['storage']:<14} │ {d['status']:<11} │")
+    print("└──────┴──────┴─────────────────┴──────────┴────────────────┴─────────────┘")
+
+    confirm = input("\n  Type 'yes' to proceed with mass migration: ").strip().lower()
+    if confirm != "yes":
+        print("\n  ✗ Migration cancelled by user.\n")
+        return
+
+    # Step 6: Perform Migrations
+    print(f"\n  🚀 Starting mass disk migration for {len(disks_to_migrate)} disk(s) …\n")
+
+    succeeded = 0
+    failed = 0
+
+    for idx, d in enumerate(disks_to_migrate, start=1):
+        rtype = d['type']
+        vmid = d['vmid']
+        name = d['name']
+        key = d['disk_key']
+        src_st = d['storage']
+
+        print(f"  [{idx}/{len(disks_to_migrate)}] Migrating {rtype} {vmid} ('{name}') disk '{key}' ({src_st} → {target_storage}) …")
+
+        try:
+            if rtype == "VM":
+                task_id = proxmox.nodes(node).qemu(vmid).move_disk.post(
+                    disk=key,
+                    storage=target_storage,
+                    delete=1 if delete_orig else 0
+                )
+            else:  # LXC
+                task_id = proxmox.nodes(node).lxc(vmid).move_volume.post(
+                    volume=key,
+                    storage=target_storage,
+                    delete=1 if delete_orig else 0
+                )
+
+            # Wait for task completion (allow up to 1800s / 30m for large disk moves)
+            wait_for_task(proxmox, node, task_id, timeout=1800)
+            print(f"      ✓ Successfully migrated {key} for {rtype} {vmid} ({name})\n")
+            succeeded += 1
+        except Exception as exc:
+            print(f"      ✗ Failed to migrate {key} for {rtype} {vmid}: {exc}\n")
+            failed += 1
+
+    print("═" * 50)
+    print(f"  Mass Disk Migration Complete:")
+    print(f"    • Succeeded: {succeeded}")
+    print(f"    • Failed:    {failed}")
+    print(f"    • Total:     {len(disks_to_migrate)}")
+    print("═" * 50 + "\n")
+
 
 # ──────────────────────────────────────────────────────────────
 # Main menu & entry point
@@ -1910,12 +2265,15 @@ def main_menu():
     print("│  [5]  Clone VM from template                │")
     print("│  [6]  Delete VM(s)                          │")
     print("├─────────────────────────────────────────────┤")
-    print("│  [7]  Exit                                  │")
+    print("│  Disk & Storage Migration                   │")
+    print("│  [7]  Mass migrate VM & LXC disks           │")
+    print("├─────────────────────────────────────────────┤")
+    print("│  [8]  Exit                                  │")
     print("└─────────────────────────────────────────────┘")
 
     while True:
         choice = input("\n  Select an option: ").strip()
-        if choice in ("1", "2", "3", "4", "5", "6", "7"):
+        if choice in ("1", "2", "3", "4", "5", "6", "7", "8"):
             return choice
         print("  ✗ Invalid selection, try again.")
 
@@ -1947,6 +2305,8 @@ def main():
         elif choice == "6":
             delete_vms(proxmox, node)
         elif choice == "7":
+            mass_migrate_disks_flow(proxmox, node)
+        elif choice == "8":
             print("\n  Goodbye!\n")
             break
 

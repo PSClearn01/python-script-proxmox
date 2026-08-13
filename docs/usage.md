@@ -26,7 +26,10 @@ After connecting to Proxmox, the script presents a **main menu**:
 │  [5]  Clone VM from template                │
 │  [6]  Delete VM(s)                          │
 ├─────────────────────────────────────────────┤
-│  [7]  Exit                                  │
+│  Disk & Storage Migration                   │
+│  [7]  Mass migrate VM & LXC disks           │
+├─────────────────────────────────────────────┤
+│  [8]  Exit                                  │
 └─────────────────────────────────────────────┘
 
   Select an option:
@@ -861,9 +864,122 @@ If a VM fails to stop, it is skipped and an error is shown.
 
 ---
 
-## Creating and Deleting in One Session
+## Mass VM & LXC Disk Migration
 
-The script returns to the main menu after each operation, so you can perform multiple container and VM actions without restarting:
+Select option **[7] Mass migrate VM & LXC disks** from the main menu to batch migrate virtual machine and LXC container disk volumes across storage pools on the node.
+
+### Step 1 — Resource Scope Selection
+
+Choose which resources to include in the migration scan:
+
+```
+┌─────────────────────────────────────────────┐
+│         Mass Disk Migration Flow            │
+└─────────────────────────────────────────────┘
+
+  Select resource type to migrate:
+  [1]  Virtual Machines (VMs) only
+  [2]  LXC Containers only
+  [3]  Both VMs and LXC Containers
+  [4]  Cancel
+
+  Select an option [3]: 3
+```
+
+### Step 2 — Migration Scope & Filtering
+
+The script scans the node for move-eligible disk volumes (`scsiX`, `virtioX`, `sataX`, `ideX`, `efidisk0`, `tpmstate0` for VMs, and `rootfs`, `mpX` for LXCs). Choose how to filter the migration batch:
+
+```
+┌─────────────────────────────────────────────┐
+│       Select Migration Scope / Filter       │
+├─────────────────────────────────────────────┤
+│  [1]  Filter by Source Storage Pool          │
+│       (Migrate all disks currently on a     │
+│        specific storage)                    │
+│  [2]  Multi-select specific VMs / LXCs      │
+│       (Choose specific VMs or CTs to move)  │
+│  [3]  Migrate ALL discovered disks          │
+│  [4]  Cancel                                │
+└─────────────────────────────────────────────┘
+```
+
+#### Option 1: Filter by Source Storage Pool
+Select an active source storage pool (e.g., `local-lvm`). All disks residing on that pool will be queued for migration.
+
+#### Option 2: Multi-select Specific VMs / LXCs
+Select specific instances using comma-separated numbers (e.g. `1, 3`), `all`, or `q`. If selected instances have disks across multiple storage pools, an optional filter allows restricting to a specific source storage.
+
+#### Option 3: Migrate ALL Disks
+Queues all move-eligible disks across all scanned VMs and LXCs.
+
+### Step 3 — Target Storage Selection
+
+Pick the destination storage pool where the disks will be moved (e.g. `ceph-store`):
+
+```
+┌─────────────────────────────────────────────┐
+│           Available Storage Pools            │
+└─────────────────────────────────────────────┘
+  [ 1]  local-lvm
+        type: lvmthin  |  total: 500.0 GB  |  free: 350.0 GB
+  [ 2]  ceph-store
+        type: rbd      |  total: 2000.0 GB |  free: 1400.0 GB
+
+  Select a storage pool number: 2
+```
+
+Disks that already reside on the target storage pool are automatically detected and skipped.
+
+### Step 4 — Option to Delete Original Disk
+
+Choose whether to remove the original volume from the source storage after a successful move (`delete=1`):
+
+```
+  Delete original disk from source storage after move? (y/n) [y]: y
+```
+
+### Step 5 — Confirmation & Execution
+
+A preview summary table is presented. Type `yes` to execute the migration batch:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     Mass Disk Migration Summary                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Target Storage Pool: ceph-store                                        │
+│  Delete Original:     Yes                                               │
+│  Total Disks to Move: 2                                                 │
+├──────┬──────┬─────────────────┬──────────┬────────────────┬─────────────┤
+│ Type │ VMID │ Name            │ Disk Key │ Source Storage │ Status      │
+├──────┼──────┼─────────────────┼──────────┼────────────────┼─────────────┤
+│ VM   │ 100  │ web-server      │ scsi0    │ local-lvm      │ running     │
+│ LXC  │ 105  │ nginx-proxy     │ rootfs   │ local-lvm      │ running     │
+└──────┴──────┴─────────────────┴──────────┴────────────────┴─────────────┘
+
+  Type 'yes' to proceed with mass migration: yes
+
+  🚀 Starting mass disk migration for 2 disk(s) …
+
+  [1/2] Migrating VM 100 ('web-server') disk 'scsi0' (local-lvm → ceph-store) …
+      ✓ Successfully migrated scsi0 for VM 100 (web-server)
+
+  [2/2] Migrating LXC 105 ('nginx-proxy') disk 'rootfs' (local-lvm → ceph-store) …
+      ✓ Successfully migrated rootfs for LXC 105 (nginx-proxy)
+
+══════════════════════════════════════════════════
+  Mass Disk Migration Complete:
+    • Succeeded: 2
+    • Failed:    0
+    • Total:     2
+══════════════════════════════════════════════════
+```
+
+---
+
+## Creating, Managing, and Deleting in One Session
+
+The script returns to the main menu after each operation, so you can perform multiple container, VM, and storage migration actions without restarting:
 
 ```bash
 python create_lxc.py
@@ -873,5 +989,6 @@ python create_lxc.py
 # → Select [4] to create a QEMU VM from an ISO
 # → Select [5] to clone a VM from a VM template
 # → Select [6] to delete VM(s)
-# → Select [7] to exit
+# → Select [7] to mass migrate VM & LXC disks
+# → Select [8] to exit
 ```
